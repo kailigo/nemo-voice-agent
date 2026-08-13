@@ -1,0 +1,201 @@
+# Finetuning config for Nemotron VoiceChat 11B (STT component only)
+# Based on s2s_duplex_stt.yaml but targeting the released 11B model.
+#
+# Usage:
+#   torchrun --nproc_per_node=8 s2s_duplex_stt_train.py \
+#       --config-path conf/finetune --config-name s2s_duplex_stt_11b \
+#       data.train_ds.input_cfg.0.shar_path=/path/to/train_shards \
+#       data.validation_ds.datasets.val_set_0.shar_path=/path/to/val_shards
+#
+# The pretrained_s2s_model path should point to the extracted STT checkpoint
+# (produced by scripts/extract_stt_checkpoint.py).
+
+model:
+  # LLM backbone — Nemotron Nano V2 9B (hybrid Mamba/Transformer)
+  pretrained_llm: nvidia/NVIDIA-Nemotron-Nano-9B-v2
+  base_model_name: backbone  # attribute name in HF model (Nemotron uses 'backbone' not 'model')
+  embed_tokens_name: embeddings  # attribute name for embeddings
+  cache_key: cache_params  # Mamba models use 'cache_params' not 'past_key_values'
+
+  # Speech encoder — NeMo Fast Conformer streaming ASR
+  pretrained_asr: nvidia/nemotron-speech-streaming-en-0.6b
+
+  # Audio codec — not needed for STT-only training (no audio generation loss)
+  pretrained_audio_codec: null
+
+  # Scoring ASR for validation metrics
+  scoring_asr: nvidia/parakeet-tdt-1.1b
+
+  # Load from released checkpoint (extracted STT weights)
+  # Set this to path of extracted STT checkpoint directory
+  pretrained_s2s_model: ???  # /path/to/extracted_stt_checkpoint
+  incremental_loading: true  # Memory-efficient loading for large models
+
+  pretrained_weights: True
+
+  # Freeze audio codec (not used here, but kept for compatibility)
+  freeze_params:
+    - "^audio_codec\\..+$"
+    - "^perception\\.preprocessor\\..+$"  # Freeze preprocessor (mel-spectrogram)
+  prevent_freeze_params: []
+
+  # Loss weights — STT-only: text loss only, no audio generation
+  audio_loss_weight: 0
+  text_loss_weight: 3
+
+  # Predict user text (ASR channel) — enables the full duplex behavior
+  predict_user_text: true
+  predict_user_text_prob: 1.0
+
+  # Function calling head
+  use_function_head: true
+
+  # Fusion method for combining audio + text embeddings
+  fuse_method: add
+  duplex_text_channel_weight: 1.0
+  duplex_user_channel_weight: 1.0
+  duplex_asr_text_weight: 1.0
+  duplex_function_channel_weight: 1.0
+
+  # LoRA configuration — enables parameter-efficient finetuning
+  lora:
+    task_type: CAUSAL_LM
+    r: 32
+    lora_alpha: 64
+    lora_dropout: 0.05
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+  # Perception (speech encoder) config
+  perception:
+    target: nemo.collections.speechlm2.modules.perception.AudioPerceptionModule
+    modality_adapter:
+      _target_: nemo.collections.asr.modules.ConformerEncoder
+      feat_in: 512
+      feat_out: -1
+      n_layers: 2
+      d_model: 512
+      subsampling: dw_striding
+      subsampling_factor: 1
+      subsampling_conv_channels: 256
+      causal_downsampling: true
+      ff_expansion_factor: 4
+      self_attention_model: rel_pos
+      n_heads: 8
+      att_context_size: [70, 1]
+      att_context_style: chunked_limited
+      xscaling: true
+      untie_biases: true
+      pos_emb_max_len: 5000
+      conv_kernel_size: 9
+      conv_norm_type: layer_norm
+      conv_context_size: causal
+      dropout: 0
+      dropout_pre_encoder: 0
+      dropout_emb: 0.0
+      dropout_att: 0
+
+  # Optimizer — lower LR for finetuning with LoRA
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4
+    betas: [0.9, 0.98]
+    weight_decay: 0.01
+    foreach: true
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+    warmup_steps: 200
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+trainer:
+  devices: 8
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: False
+  enable_checkpointing: False
+  use_distributed_sampler: False
+  max_steps: 10000
+  limit_train_batches: 100  # "epoch" size for checkpoint intervals
+  val_check_interval: ${trainer.limit_train_batches}
+  limit_val_batches: 10
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 4
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+    # For FSDP (if DDP OOMs):
+    # _target_: lightning.pytorch.strategies.ModelParallelStrategy
+    # data_parallel_size: 8
+
+data:
+  frame_length: 0.08
+  source_sample_rate: 16000
+  target_sample_rate: 22050
+  input_roles: ["user", "User"]
+  output_roles: ["agent", "Assistant", "assistant", "Agent"]
+
+  train_ds:
+    sample_rate: ${data.target_sample_rate}
+    input_cfg:
+      - type: lhotse_shar
+        shar_path: ???  # /path/to/train/shards
+    seed: 42
+    shard_seed: "randomized"
+    num_workers: 4
+    batch_size: 2
+    # For bucketing (recommended for variable-length conversations):
+    # batch_size: null
+    # batch_duration: 120
+    # bucket_duration_bins: [8, 12, 18, 25, 35, 50, 80, 120]
+    # use_bucketing: true
+    # num_buckets: 8
+    # bucket_buffer_size: 2000
+
+  validation_ds:
+    datasets:
+      val_set_0:
+        shar_path: ???  # /path/to/val/shards
+    sample_rate: ${data.target_sample_rate}
+    batch_size: 1
+    seed: 42
+    shard_seed: "randomized"
+
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: results/finetune_stt_11b/
+  name: nemotron_voicechat_finetune
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  use_datetime_version: true
+  max_time_per_run: "03:50:00"
+
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: nemotron-voicechat-finetune
+    project: voicechat_finetune
+    resume: true
+
+  checkpoint_callback_params:
+    filename: "{step}"
+    monitor: val_asr_bleu
+    mode: max
+    every_n_train_steps: 500
+    save_top_k: 3
+    always_save_nemo: false
+    save_nemo_on_train_end: false
