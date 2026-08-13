@@ -1,0 +1,11 @@
+{
+  "num_cuts": 3,
+  "total_duration_seconds": 567.6,
+  "total_duration_hours": 0.15766666666666668,
+  "total_tool_calls": 16,
+  "user_sample_rate": 16000,
+  "agent_sample_rate": 22050,
+  "min_reward_filter": 1.0,
+  "format": "nemotron_voicechat_duplex_s2s_fc",
+  "shar_path": "/tmp/tau2_nemotron_training/shards"
+}

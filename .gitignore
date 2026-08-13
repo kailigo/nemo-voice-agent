@@ -183,3 +183,9 @@ nemo_experiments/
 
 slurm*.out
 data/
+
+# Training samples (override data/ exclusion)
+!data/
+data/*
+!data/tau2_training_samples/
+!data/tau2_training_samples/**
