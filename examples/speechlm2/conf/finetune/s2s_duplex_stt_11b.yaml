@@ -39,27 +39,78 @@ model:
     - "^perception\\.preprocessor\\..+$"  # Freeze preprocessor (mel-spectrogram)
   prevent_freeze_params: []
 
-  # Loss weights — STT-only: text loss only, no audio generation
+  # Loss weights — STT-only: no audio generation.
   audio_loss_weight: 0
-  text_loss_weight: 3
+  # 1, not 3. The 3 came from the 1.1B template (conf/s2s_duplex_stt.yaml, which pairs it with
+  # audio_loss_weight: 4); the released 11B uses 1. text_loss_weight is a RELATIVE weight
+  # against function_loss (~L2602: loss = text_loss_weight*text_loss + function_loss_weight*
+  # function_loss), so with function_loss_weight at 1.0, a 3 gives the text channel 3x the
+  # gradient of the function channel — backwards for tau2, where tool calls are the point.
+  text_loss_weight: 1
+  function_loss_weight: 1.0
 
-  # Predict user text (ASR channel) — enables the full duplex behavior
-  predict_user_text: true
-  predict_user_text_prob: 1.0
+  # Per-token-class loss scales, copied verbatim from the released 11B config.json. Both are
+  # gated by `if self.cfg.get(...)` (~L2232 and ~L2436), so OMITTING them is not a small
+  # deviation — it silently falls back to uniform weight 1.0 everywhere, and that breaks
+  # badly for a duplex model. The channels are emitted along the audio timeline at ~12.5
+  # frames/s, so the overwhelming majority of frames are PAD. Uniform weighting therefore
+  # makes "stay silent" the loss-minimising behaviour: text is upweighted 5x over pad here,
+  # and bos 12.5x because bos/eos ARE the turn-taking decisions. The function channel is more
+  # extreme still — pad 0.3 vs call 64.0, a 213x ratio — because tool-call content occupies a
+  # handful of frames per conversation. Leave these unset and function_head is trained
+  # almost entirely on pad, i.e. it learns to emit nothing.
+  token_loss_weight:
+    bos: 12.5
+    eos: 7.5
+    pad: 1.0
+    text: 5.0
+  function_token_loss_weight:
+    call: 64.0
+    sotc: 6.0
+    eotc: 6.0
+    eotr: 3.0
+    pad: 0.3
+
+  # ASR channel (predicting user text) is OFF, matching the released 11B exactly:
+  # its config.json has predict_user_text=false, use_separate_asr_head=false,
+  # asr_loss_weight=0.0. Turning it on makes __init__ build asr_head and
+  # embed_asr_tokens (1.17B params) for which the checkpoint has no weights — and
+  # because line ~275 deep-copies them from lm_head *before* the checkpoint loads,
+  # they'd copy the base HF lm_head/embed_tokens (from cfg.pretrained_llm, loaded at
+  # line ~228), not the VoiceChat-finetuned ones. Start faithful to the release;
+  # revisit if we need the model transcribing user speech.
+  #
+  # To re-enable: set this true AND regenerate the checkpoint with
+  # `remap_checkpoint_for_lora.py --warm-start-asr-head` so those two tensors are
+  # seeded from the pretrained lm_head/embed_tokens (stt_extracted_lora already
+  # contains them; they are simply discarded while this is false).
+  predict_user_text: false
+  predict_user_text_prob: 1.0  # inert while predict_user_text is false
 
   # Function calling head
   use_function_head: true
 
-  # Fusion method for combining audio + text embeddings
+  # Fusion method for combining audio + text embeddings. These are ARCHITECTURAL scalars,
+  # not loss weights: create_fusion_module multiplies each channel's embedding by its weight
+  # before summing them (duplex_stt_model.py ~296). They must therefore match the values the
+  # released checkpoint was trained under, or the forward pass no longer matches the weights
+  # we load. All four below are taken from voicechat-11b/config.json — note function is 2.0,
+  # which is easy to miss because the NeMo default is 1.0.
   fuse_method: add
   duplex_text_channel_weight: 1.0
   duplex_user_channel_weight: 1.0
-  duplex_asr_text_weight: 1.0
-  duplex_function_channel_weight: 1.0
+  duplex_asr_text_weight: 1.0  # inert while predict_user_text is false
+  duplex_function_channel_weight: 2.0
 
   # LoRA configuration — enables parameter-efficient finetuning
+  # NOTE: deliberately no `task_type: CAUSAL_LM`. DuplexSTTModel sets
+  # self.llm = llm.backbone (a bare NemotronHModel) and keeps lm_head separately,
+  # so peft's PeftModelForCausalLM is the wrong wrapper: its __init__ reads
+  # base_model.prepare_inputs_for_generation, which only exists on
+  # NemotronHForCausalLM, and it raises AttributeError here. We also never call
+  # .generate() or let peft compute the LM loss, so the generic LoraModel
+  # wrapper (task_type unset) is both correct and version-robust.
   lora:
-    task_type: CAUSAL_LM
     r: 32
     lora_alpha: 64
     lora_dropout: 0.05
@@ -72,34 +123,27 @@ model:
       - up_proj
       - down_proj
 
-  # Perception (speech encoder) config
+  # Perception (speech encoder) config.
+  # `preprocessor` and `encoder` are filled in from the pretrained_asr .nemo by
+  # setup_speech_encoder(); only the keys we want to override belong here.
   perception:
     target: nemo.collections.speechlm2.modules.perception.AudioPerceptionModule
+
+    # The released 11B has NO trainable modality adapter. Its config.json declares an
+    # IdentityConnector (d_model 1024), the checkpoint contains zero
+    # perception.modality_adapter.* tensors, and perception.proj is Linear(1024, 4480)
+    # wired straight off the encoder's d_model=1024 output. A 2-layer Conformer adapter
+    # here would be randomly initialised *and* make proj Linear(512, 4480), so the
+    # pretrained proj weights would silently fail to load.
     modality_adapter:
-      _target_: nemo.collections.asr.modules.ConformerEncoder
-      feat_in: 512
-      feat_out: -1
-      n_layers: 2
-      d_model: 512
-      subsampling: dw_striding
-      subsampling_factor: 1
-      subsampling_conv_channels: 256
-      causal_downsampling: true
-      ff_expansion_factor: 4
-      self_attention_model: rel_pos
-      n_heads: 8
-      att_context_size: [70, 1]
-      att_context_style: chunked_limited
-      xscaling: true
-      untie_biases: true
-      pos_emb_max_len: 5000
-      conv_kernel_size: 9
-      conv_norm_type: layer_norm
-      conv_context_size: causal
-      dropout: 0
-      dropout_pre_encoder: 0
-      dropout_emb: 0.0
-      dropout_att: 0
+      _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+      d_model: 1024
+
+    # The ASR .nemo ships cache-aware multi-context [[70,13],[70,6],[70,1],[70,0]];
+    # the released 11B pins the fully-causal [70, 0]. Match it so finetuning starts
+    # from the same streaming behaviour as the checkpoint we are initialising from.
+    encoder:
+      att_context_size: [70, 0]
 
   # Optimizer — lower LR for finetuning with LoRA
   optimizer:
@@ -124,9 +168,20 @@ trainer:
   enable_checkpointing: False
   use_distributed_sampler: False
   max_steps: 10000
-  limit_train_batches: 100  # "epoch" size for checkpoint intervals
+  # CAREFUL: limit_train_batches and val_check_interval count DATALOADER BATCHES, while
+  # max_steps and checkpoint_callback_params.every_n_train_steps count OPTIMIZER steps. With
+  # accumulate_grad_batches: 4 those differ by 4x. At the old value (100) an "epoch" was only
+  # 25 optimizer steps, so validation fired every 25 steps — measured 8 validations inside a
+  # 20-step run. That is ruinous here because validation is autoregressive generation through
+  # the no-cache Nemotron path at ~16 s PER SAMPLE (measured), not a cheap forward pass: 135 s
+  # of validation against 6.6 s of training. 2000 batches = 500 optimizer steps, which lines
+  # the epoch boundary up with every_n_train_steps: 500 so each checkpoint has a fresh
+  # val_txt_bleu to monitor.
+  limit_train_batches: 2000
   val_check_interval: ${trainer.limit_train_batches}
-  limit_val_batches: 10
+  # 4 batches x batch_size 1 x 8 ranks = 32 conversations scored, ~64 s. Raising this buys less
+  # noisy BLEU at ~16 s per added sample per rank; 10 would put ~40% of wall clock in validation.
+  limit_val_batches: 4
   log_every_n_steps: 10
   num_sanity_val_steps: 1
   gradient_clip_val: 1.0
@@ -174,12 +229,20 @@ data:
 
 exp_manager:
   exp_dir: null
+  # DISK: measured 29.9 GB per checkpoint (NeMo saves the full 10.1B state dict plus AdamW
+  # moments for the trainable params, not just the LoRA deltas). With save_top_k: 3 plus the
+  # rolling "-last", budget ~120 GB here. Point this at a filesystem that has it — a run on a
+  # ~100 GB root/scratch disk dies with OSError: [Errno 28] partway through the second save,
+  # after an hour of training. Lightning's _atomic_save also serialises the whole checkpoint
+  # into host RAM before writing, so expect a ~30 GB RSS spike on rank 0 at each save.
   explicit_log_dir: results/finetune_stt_11b/
   name: nemotron_voicechat_finetune
   create_tensorboard_logger: true
   create_checkpoint_callback: true
   use_datetime_version: true
-  max_time_per_run: "03:50:00"
+  # Lightning's Timer wants DD:HH:MM:SS — four fields. "03:50:00" is rejected outright
+  # (MisconfigurationException at startup), it is not read as 3h50m. This is 3h50m.
+  max_time_per_run: "00:03:50:00"
 
   resume_from_checkpoint: null
   resume_if_exists: true
@@ -193,9 +256,21 @@ exp_manager:
 
   checkpoint_callback_params:
     filename: "{step}"
-    monitor: val_asr_bleu
+    # NOT val_asr_bleu — DuplexSTTModel never logs that key (it is a DuplexS2S/EAR-TTS
+    # metric). Its on_validation_epoch_end (~L2730) logs val_txt_bleu,
+    # val_txt_bleu_after_tool, val_txt_bleu_tool_call and the turn-taking metrics; the
+    # val_src_* ASR metrics only exist when predict_user_text is true, which ours is not.
+    # Monitoring a key that is never logged makes Lightning's ModelCheckpoint raise at the
+    # first validation end — i.e. it would crash at step 500, an hour into the run.
+    # val_txt_bleu is the always-logged agent-text metric. For tau2 tool use,
+    # val_txt_bleu_tool_call is the more targeted choice once we see it move.
+    monitor: val_txt_bleu
     mode: max
     every_n_train_steps: 500
+    # Required. NeMo's CallbackParams defaults every_n_epochs to 1 (exp_manager.py ~L141) and
+    # Lightning rejects every_n_train_steps and every_n_epochs being set together, so leaving
+    # this out makes ModelCheckpoint raise MisconfigurationException at startup.
+    every_n_epochs: 0
     save_top_k: 3
     always_save_nemo: false
     save_nemo_on_train_end: false

@@ -23,30 +23,52 @@ Our custom scripts live in `scripts/` within this clone. They are:
 | Script | Purpose |
 |--------|---------|
 | `scripts/extract_stt_checkpoint.py` | Split combined 11B checkpoint → STT-only weights |
+| `scripts/remap_checkpoint_for_lora.py` | **Mandatory.** Rename extracted keys to their LoRA-wrapped form (see Step 2b) |
 | `scripts/tau2_to_conversations.py` | Convert tau2-bench tasks → conversation JSON |
 | `scripts/prepare_lhotse_data.py` | Conversation JSON → Lhotse Shar training format |
 | `scripts/run_finetune.sh` | One-command training launch |
-| `scripts/verify_training_setup.py` | Dry-run config/model sanity check (no GPU needed) |
+| `scripts/verify_training_setup.py` | Config/model sanity check + dummy forward pass (**needs a GPU**) |
+| `scripts/verify_checkpoint_load.py` | Audit which model params actually receive checkpoint weights |
+| `scripts/smoke_test_inference.py` | Real-audio inference against the training config; proves the weights are live |
 
 Training config: `examples/speechlm2/conf/finetune/s2s_duplex_stt_11b.yaml`
+
+### Actual paths on this machine
+
+Commands below use generic `/data/...` paths. On the current 8× H200 box they are:
+
+| Generic | Actual |
+|---------|--------|
+| repo clone | `/fsx/home/kai.li/code/nemotron-voicechat` |
+| conda env | `/fsx/home/kai.li/miniforge3/envs/voicechat` (`conda activate voicechat`) |
+| `/data/checkpoints/voicechat-11b` | `/fsx/home/kai.li/data/voicechat/voicechat-11b` |
+| `/data/checkpoints/stt_extracted_lora` | `/fsx/home/kai.li/data/voicechat/stt_extracted_lora` ← **use this one** |
+| `/data/training/...` | not created yet — no training data exists |
 
 ---
 
 ## Architecture (what we're training)
 
 ```
-NemotronVoiceChat 11B = DuplexSTTModel (~9.6B) + DuplexEARTTS (~1.5B)
+NemotronVoiceChat 11B = DuplexSTTModel (10.10B) + DuplexEARTTS (1.00B)
                          ^^^^^^^^^^^^^^^^
                          This is what we finetune
 ```
 
-**DuplexSTTModel** components:
-- **Speech Encoder**: Fast Conformer streaming, 0.6B params (`nvidia/nemotron-speech-streaming-en-0.6b`)
-- **Modality Adapter**: 2-layer Conformer, ~5M params (bridges encoder → LLM)
-- **LLM**: Nemotron Nano V2 9B — hybrid Mamba/Transformer (`nvidia/NVIDIA-Nemotron-Nano-9B-v2`)
-- **Text head**: Standard lm_head for next-token prediction
+Params measured from the released checkpoint, not estimated. As instantiated from our config
+(`predict_user_text: false`) the STT model is **10.13B total / 2.41B trainable / 7.71B frozen**.
 
-**Training approach**: LoRA on the LLM (rank=32, alpha=64) + full training of speech encoder & modality adapter. TTS stays frozen/separate.
+**DuplexSTTModel** components:
+- **Speech Encoder**: Fast Conformer streaming, 0.61B params (`nvidia/nemotron-speech-streaming-en-0.6b`)
+- **Modality Adapter**: `IdentityConnector` — **zero params**. The encoder already emits d_model=1024, so there is nothing to bridge. (Earlier drafts of this doc claimed a 2-layer Conformer, ~5M params; that is the 1.1B recipe, not this one.)
+- **LLM**: Nemotron Nano V2 9B — hybrid Mamba/Transformer, 7.75B here (`nvidia/NVIDIA-Nemotron-Nano-9B-v2`)
+- **Heads**: three tied-shape 0.587B blocks — `embed_tokens`, `lm_head`, and `function_head` (function-calling channel)
+
+**Training approach**: LoRA on the LLM (rank=32, alpha=64), plus **fully trained** speech encoder,
+`embed_tokens`, `lm_head` and `function_head`. This is not "LoRA-only": `freeze_params` matches
+only `^audio_codec\..+$` and `^perception\.preprocessor\..+$`, so everything else outside the
+LoRA-wrapped LLM is trainable. That is 2.41B trainable params, ~4x what a LoRA-only reading
+suggests — budget optimizer state accordingly. TTS stays frozen/separate.
 
 ---
 
@@ -54,21 +76,37 @@ NemotronVoiceChat 11B = DuplexSTTModel (~9.6B) + DuplexEARTTS (~1.5B)
 
 ### 0. Environment Setup
 
+**Do not use the unpinned recipe this section used to give.** The authoritative recipe is in the
+NeMo Speech branch's own README (`nemotron-labs-voicechat`, "Create the conda environment"), and
+it must be followed verbatim: python 3.12, `torch==2.10.0` / `torchvision==0.25.0` /
+`torchaudio==2.10.0`, `pip install -e ".[all]"`, uninstall `nvidia-resiliency-ext`, then the
+pinned `transformers==4.56.0` / `lhotse==1.32.2` / `torchcodec==0.10.0`, and finally:
+
 ```bash
-# Clone repo
-git clone https://github.com/NVIDIA-NeMo/Speech.git --branch nemotron-labs-voicechat nemotron-voicechat
-cd nemotron-voicechat
+pip install --no-build-isolation --no-deps causal-conv1d==1.6.2.post1 mamba-ssm==2.3.2.post1
+```
 
-# Install NeMo (editable)
-pip install -e .
+torch 2.10 is the newest release with **prebuilt** mamba-ssm/causal-conv1d wheels *and* a matching
+torchaudio, so this takes ~40 s. Unpinned torch forces an nvcc build from source: 20+ minutes and
+frequently broken.
 
-# Key dependencies
-pip install safetensors lhotse soundfile torchaudio peft edge-tts
-pip install lightning omegaconf hydra-core
+Then apply one fix the branch README omits. `import torchcodec` fails on this box because conda's
+ffmpeg/libopenvino need CXXABI_1.3.15+ while the system libstdc++ (Ubuntu 22.04 / gcc 11) only has
+1.3.13 and wins the loader search:
 
-# For Nemotron Nano (Mamba support)
-pip install mamba-ssm causal-conv1d  # requires CUDA
+```bash
+conda install -c conda-forge "ffmpeg=7"
+# plus an etc/conda/activate.d hook prepending $CONDA_PREFIX/lib to LD_LIBRARY_PATH
+```
 
+Both are already applied in the `voicechat` env on this machine. Verify — this must print
+`2.10.0+cu128 True True NVIDIA H200`:
+
+```bash
+python -c "import torch, torchcodec; from transformers.utils.import_utils import is_mamba_2_ssm_available as m, is_causal_conv1d_available as c; print(torch.__version__, m(), c(), torch.cuda.get_device_name(0))"
+```
+
+```bash
 # tau2-bench (for data generation)
 pip install -e /path/to/tau2-bench
 ```
@@ -95,15 +133,62 @@ This produces:
 - `/data/checkpoints/stt_extracted/model.safetensors` — STT weights with prefix stripped
 - `/data/checkpoints/stt_extracted_tts/model.safetensors` — TTS weights (for later)
 
-Expected output: ~9.6B params for STT, ~1.5B for TTS.
+Expected output: **10.10B** params for STT, **1.00B** for TTS.
 
-### 3. Verify Setup (optional but recommended)
+### 2b. Remap keys for LoRA (MANDATORY — skipping this silently breaks training)
 
 ```bash
-python scripts/verify_training_setup.py --config conf/finetune/s2s_duplex_stt_11b.yaml
+python scripts/remap_checkpoint_for_lora.py \
+    --src /data/checkpoints/stt_extracted \
+    --dst /data/checkpoints/stt_extracted_lora
 ```
 
-This checks config resolution, model instantiation, and forward pass with dummy data. Catches issues before committing to a full run.
+`DuplexSTTModel.__init__` installs LoRA (`duplex_stt_model.py` ~L313) *before* it loads
+`pretrained_s2s_model` (~L321). peft has by then renamed every LLM key
+(`llm.layers.0…` → `llm.base_model.model.layers.0…`, plus `.base_layer` on LoRA-targeted
+projections). The loader copies by exact key match and warns only about checkpoint keys missing
+from the model — never about model params that received nothing. Point it at `stt_extracted`
+directly and **339 LLM tensors (7.75B params) are skipped**, with one warning line as the symptom.
+
+The failure is nearly invisible: the skipped LLM does not become noise. `cfg.pretrained_llm` was
+already loaded from HF at ~L228, so the LLM falls back to base Nemotron-Nano-9B-v2 — fluent
+English with none of the VoiceChat duplex / turn-taking / function-calling finetuning. You cannot
+catch this by reading generated text.
+
+### 3. Verify Setup (do not skip)
+
+```bash
+# 3a. Names and shapes: every non-LoRA model param must receive a checkpoint tensor
+python scripts/verify_checkpoint_load.py --checkpoint /data/checkpoints/stt_extracted_lora
+# want: "Exact-name matches: N / N matchable" and "MODEL-ONLY: 0 tensors"
+
+# 3b. Config + instantiation + dummy forward pass. NEEDS A GPU (see below).
+python scripts/verify_training_setup.py --config conf/finetune/s2s_duplex_stt_11b.yaml
+
+# 3c. Values and behaviour: real audio through the real training config
+python scripts/smoke_test_inference.py \
+    --checkpoint /data/checkpoints/stt_extracted_lora \
+    --wav examples/speechlm2/sample_audio/sample_general.wav
+```
+
+**`verify_training_setup.py` requires a GPU** — an earlier version of this doc said "no GPU
+needed", which is wrong. Nemotron-H's Mamba mixer calls
+`torch.cuda.stream(torch.cuda.default_stream(hidden_states.device))` with no CPU fallback, so the
+LLM cannot run on CPU at all. Steps 1, 2 and 4 of that script are CPU-safe; the forward pass is
+not. Use `--skip_forward` to leave it out.
+
+For 3c, the pass/fail signal is **turn-taking timestamps** (`<$0.72$>`, `<|2.08|>`) in the output,
+not fluency — fluency proves nothing, per the fallback described in 2b. A correct run on
+`sample_general.wav` looks like:
+
+```
+<$0.72$> <|2.08|> Hi there! How can I help you today? <$8.56$> <|12.16|> The sky is blue. …
+```
+
+To exercise the function-calling channel (relevant for tau2), add `--function-calling`, which
+declares tools via the repo's own `template.jinja` and decodes the function channel. Without
+declared tools the model correctly *declines* to call anything, which looks like a broken
+`function_head` but is not.
 
 ### 4. Prepare Training Data
 
@@ -140,7 +225,7 @@ For a proper fix, `create_lhotse_cutset()` should:
 
 ```bash
 bash scripts/run_finetune.sh \
-    /data/checkpoints/stt_extracted \
+    /data/checkpoints/stt_extracted_lora \
     /data/training/lhotse/shards \
     /data/training/lhotse_val/shards \
     8  # number of GPUs
@@ -155,7 +240,7 @@ torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
     s2s_duplex_stt_train.py \
     --config-path conf/finetune \
     --config-name s2s_duplex_stt_11b \
-    model.pretrained_s2s_model=/data/checkpoints/stt_extracted \
+    model.pretrained_s2s_model=/data/checkpoints/stt_extracted_lora \
     data.train_ds.input_cfg.0.shar_path=/data/training/lhotse/shards \
     data.validation_ds.datasets.val_set_0.shar_path=/data/training/lhotse_val/shards \
     trainer.devices=8
@@ -183,8 +268,10 @@ File: `examples/speechlm2/conf/finetune/s2s_duplex_stt_11b.yaml`
 | Checkpoints | Every 500 steps, top-3 by val_asr_bleu | |
 | Output dir | `results/finetune_stt_11b/` | |
 
-**Frozen**: Preprocessor (mel-spectrogram), audio codec  
-**Trainable**: Speech encoder (0.6B), modality adapter (~5M), LLM via LoRA (~50M)
+**Frozen** (all `freeze_params` matches): audio codec, `perception.preprocessor` (mel-spectrogram)  
+**Trainable (2.41B total)**: speech encoder 0.61B, `embed_tokens` 0.587B, `lm_head` 0.587B,
+`function_head` 0.587B, LLM via LoRA ~0.05B. There is no modality adapter to train
+(`IdentityConnector`, zero params).
 
 ---
 
@@ -192,11 +279,22 @@ File: `examples/speechlm2/conf/finetune/s2s_duplex_stt_11b.yaml`
 
 | Config | GPUs | Batch | Notes |
 |--------|------|-------|-------|
-| Minimum | 4× A100 80GB | 1/GPU, accum=8 | LoRA only, gradient checkpointing |
-| Recommended | 8× A100 80GB | 2/GPU, accum=4 | Full encoder + LoRA |
-| Fast | 8× H100 80GB | 2-4/GPU | 2-3x faster |
+| This machine | 8× H200 143GB | 2/GPU, accum=4 | What the config targets; comfortable |
+| Workable | 8× A100/H100 80GB | 1/GPU, accum=8 | Tight — see the optimizer-state note below |
 
-Memory estimate: ~40GB per GPU (11B in bf16 + activations + LoRA adapters). A100 80GB should fit batch_size=2 comfortably.
+The earlier "Minimum: 4× A100 80GB, LoRA only" row was based on a ~0.65B trainable-param estimate
+and understated optimizer memory by roughly 5x. The real figure is **2.41B trainable**, because
+`freeze_params` leaves the speech encoder and all three 0.587B head/embedding blocks unfrozen (see
+Architecture above). Per rank that is:
+
+- weights: 10.13B in bf16 ≈ 20 GB
+- AdamW state for 2.41B params: fp32 m+v ≈ **19 GB** (plus fp32 master weights if used)
+- gradients + activations on top
+
+DDP replicates all of this per GPU, so 80 GB is workable but not roomy. If you genuinely want
+LoRA-only memory, add `^embed_tokens\..+$`, `^lm_head\..+$`, `^function_head\..+$` and
+`^perception\..+$` to `freeze_params` — but note the released 11B was trained with these unfrozen,
+so freezing them departs from the recipe.
 
 If DDP OOMs, switch to FSDP by editing the config:
 ```yaml
@@ -244,7 +342,11 @@ This is already handled — no code changes needed. The config sets `base_model_
 
 2. **`NemotronVoiceChat.training_step()` returns None**: This is the combined model class — don't train via that. Train `DuplexSTTModel` directly (which our config does via `s2s_duplex_stt_train.py`).
 
-3. **Mamba kernel installation**: `pip install mamba-ssm causal-conv1d` requires CUDA toolkit. If it fails, the model falls back to a pure-PyTorch implementation (slower but works).
+3. **Mamba kernel installation**: use the pinned wheels in Step 0. If the fast kernels are absent, transformers falls back to a slower pure-PyTorch mixer — but that fallback is still **CUDA-only**, so it is not a way to run on CPU.
+
+7. **Architectural config keys must match `voicechat-11b/config.json`.** `duplex_*_channel_weight` read like loss weights but are not: `create_fusion_module` (`duplex_stt_model.py` ~L296) multiplies each channel's embedding by its weight before summing into the LLM input, so they are part of the forward pass. NeMo defaults all four to 1.0, but the released checkpoint uses `duplex_function_channel_weight: 2.0`. With 1.0 an FC test still emitted a correct tool call, but two decoder steps late and with the agent text channel collapsed to 19 characters. Same class of key: `predict_user_text`, `use_function_head`, `fuse_method`. Loss weights are ours to tune; these are not.
+
+8. **`predict_user_text` must stay `false`** to match the release. Turning it on builds `asr_head` + `embed_asr_tokens` (1.17B) which the checkpoint has no weights for, and because they are deep-copied from `lm_head` at ~L275 *before* the checkpoint loads, they get the base HF head rather than the VoiceChat-finetuned one. To enable it properly, regenerate with `remap_checkpoint_for_lora.py --warm-start-asr-head`.
 
 4. **HuggingFace `trust_remote_code=True`**: Required for Nemotron Nano. The model loading code already sets this.
 
@@ -258,17 +360,21 @@ This is already handled — no code changes needed. The config sets `base_model_
 
 Before a full training run, verify incrementally:
 
-```bash
-# 1. Config loads correctly
-python scripts/verify_training_setup.py --skip_model
+Steps 1-2 below are already green on this machine; steps 3-4 are blocked only on training data.
 
-# 2. Model instantiates (with pretrained weights)
+```bash
+# 1. Checkpoint audit + config + dummy forward pass (see Step 3 above for all three gates)
+python scripts/verify_checkpoint_load.py --checkpoint /data/checkpoints/stt_extracted_lora
 python scripts/verify_training_setup.py
+
+# 2. Real audio, including the function-calling channel
+python scripts/smoke_test_inference.py --checkpoint /data/checkpoints/stt_extracted_lora \
+    --wav examples/speechlm2/sample_audio/sample_fc.wav --function-calling
 
 # 3. Overfit on 10 examples (loss should approach 0)
 torchrun --nproc_per_node=1 s2s_duplex_stt_train.py \
     --config-path conf/finetune --config-name s2s_duplex_stt_11b \
-    model.pretrained_s2s_model=/data/checkpoints/stt_extracted \
+    model.pretrained_s2s_model=/data/checkpoints/stt_extracted_lora \
     data.train_ds.input_cfg.0.shar_path=/data/training/lhotse/shards \
     data.validation_ds.datasets.val_set_0.shar_path=/data/training/lhotse/shards \
     trainer.devices=1 \
@@ -278,7 +384,7 @@ torchrun --nproc_per_node=1 s2s_duplex_stt_train.py \
 # 4. Multi-GPU check (short run)
 torchrun --nproc_per_node=4 s2s_duplex_stt_train.py \
     --config-path conf/finetune --config-name s2s_duplex_stt_11b \
-    model.pretrained_s2s_model=/data/checkpoints/stt_extracted \
+    model.pretrained_s2s_model=/data/checkpoints/stt_extracted_lora \
     data.train_ds.input_cfg.0.shar_path=/data/training/lhotse/shards \
     data.validation_ds.datasets.val_set_0.shar_path=/data/training/lhotse/shards \
     trainer.devices=4 \
@@ -317,10 +423,13 @@ These files need to exist on the GPU machine:
 nemotron-voicechat/                          # git clone of NeMo Speech
 ├── scripts/
 │   ├── extract_stt_checkpoint.py            # OUR SCRIPT
+│   ├── remap_checkpoint_for_lora.py         # OUR SCRIPT (mandatory, see Step 2b)
 │   ├── tau2_to_conversations.py             # OUR SCRIPT
 │   ├── prepare_lhotse_data.py               # OUR SCRIPT
 │   ├── run_finetune.sh                      # OUR SCRIPT
-│   └── verify_training_setup.py             # OUR SCRIPT
+│   ├── verify_training_setup.py             # OUR SCRIPT
+│   ├── verify_checkpoint_load.py            # OUR SCRIPT
+│   └── smoke_test_inference.py              # OUR SCRIPT
 ├── examples/speechlm2/conf/finetune/
 │   └── s2s_duplex_stt_11b.yaml             # OUR CONFIG
 └── (rest is from the git clone)
@@ -329,4 +438,4 @@ tau2-bench/                                  # Needed for data generation
 └── src/tau2/...
 ```
 
-If the GPU machine can't access this Mac, copy the 6 custom files manually (5 scripts + 1 config). Everything else comes from `git clone`.
+If the GPU machine can't access this Mac, copy the 9 custom files manually (8 scripts + 1 config). Everything else comes from `git clone`.
