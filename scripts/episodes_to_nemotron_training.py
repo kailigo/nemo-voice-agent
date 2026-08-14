@@ -260,6 +260,20 @@ def build_training_cut(episode: dict, output_dir: str):
     sup_idx = 0
 
     # Supervision 0: system prompt
+    #
+    # NOTE the custom={"function": ""} on this and every speech supervision below. It looks
+    # redundant but it is REQUIRED, because s2s_dataset.py gates all function-call extraction on
+    # supervisions[1] specifically (~L1593):
+    #
+    #     if len(cut.supervisions) > 1 and 'function' in cut.supervisions[1].custom:
+    #
+    # supervisions[1] here is a speech turn, and lhotse's SupervisionSegment.custom defaults to
+    # None, so `'function' in None` raises TypeError and the whole batch dies in the dataloader.
+    # The very next line then calls sup.custom.get("function") across ALL of supervisions[1:], so
+    # it is not enough to patch index 1 alone — every supervision needs the dict.
+    #
+    # An empty string is the safe value: the text-channel inclusion rule (~L2274) keeps a turn
+    # when custom['function'] == '', so speech turns still train the text channel normally.
     supervisions.append(SupervisionSegment(
         id=f"{cut_id}_sup_{sup_idx:03d}",
         recording_id=user_recording.id,
@@ -267,6 +281,7 @@ def build_training_cut(episode: dict, output_dir: str):
         duration=0.0,
         text=system_prompt,
         speaker="system",
+        custom={"function": ""},
     ))
     sup_idx += 1
 
@@ -296,6 +311,7 @@ def build_training_cut(episode: dict, output_dir: str):
             duration=seg["end"] - seg["start"],
             text=seg["text"],
             speaker=seg["speaker"],
+            custom={"function": ""},  # required, not redundant -- see supervision 0 above
         ))
         sup_idx += 1
 
@@ -385,8 +401,22 @@ def validate_training_cut(cut) -> tuple[bool, str]:
     return True, "ok"
 
 
-def export_to_shar(cuts, output_dir: str) -> str:
-    """Export cuts to Lhotse Shar format."""
+def export_to_shar(cuts, output_dir: str, shard_size: int = 1) -> str:
+    """Export cuts to Lhotse Shar format.
+
+    shard_size drives how many shards you get, and that caps data-parallel width: Lhotse hands
+    whole shards to ranks, so a run on N GPUs needs >= N shards or the surplus ranks sit idle
+    (and NeMo errors when a rank gets nothing). Default 1 cut/shard maximises parallelism, which
+    is what you want for the small prototyping sets; raise it for real corpora where thousands of
+    single-cut shards would be wasteful.
+
+    Nothing except the Shar files may live in shard_dir. Lhotse infers field names from EVERY
+    entry in the directory (lhotse/shar/readers/lazy.py ~L202,
+    `fields = set(p.stem.split(".")[0] for p in in_dir.glob("*"))`), so a stray metadata.json
+    becomes a phantom field named "metadata" and is then parsed as JSONL -- which fails with a
+    confusing `JSONDecodeError: Expecting property name ... line 2 column 1 (char 2)` at the first
+    training batch. That is why metadata.json is written to output_dir, one level up.
+    """
     from lhotse import CutSet
 
     shar_dir = os.path.join(output_dir, "shards")
@@ -396,7 +426,7 @@ def export_to_shar(cuts, output_dir: str) -> str:
     cutset.to_shar(
         output_dir=shar_dir,
         fields={"recording": "wav", "target_audio": "wav"},
-        shard_size=50,
+        shard_size=shard_size,
     )
     return shar_dir
 
@@ -408,6 +438,13 @@ def main():
     parser.add_argument("--sim_dir", required=True, help="Path to data/simulations directory")
     parser.add_argument("--output", required=True, help="Output directory")
     parser.add_argument("--min_reward", type=float, default=1.0, help="Minimum reward filter")
+    parser.add_argument(
+        "--shard_size",
+        type=int,
+        default=1,
+        help="Cuts per shard. Shard count caps data-parallel width, so keep it low enough that "
+        "num_cuts/shard_size >= your GPU count (default 1 = one cut per shard).",
+    )
     parser.add_argument("--dry_run", action="store_true", help="Just discover episodes")
     args = parser.parse_args()
 
@@ -462,7 +499,7 @@ def main():
     # Export
     os.makedirs(args.output, exist_ok=True)
     print(f"\nExporting to Lhotse Shar...")
-    shar_dir = export_to_shar(cuts, args.output)
+    shar_dir = export_to_shar(cuts, args.output, shard_size=args.shard_size)
     print(f"  Exported to: {shar_dir}")
 
     # Metadata
