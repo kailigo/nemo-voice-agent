@@ -128,7 +128,11 @@ huggingface-cli download nvidia/NVIDIA-NemotronLabs-VoiceChat-11B \
     --local-dir /data/checkpoints/voicechat-11b
 ```
 
-The checkpoint is a single `model.safetensors` file (~44.4 GB, FP32). Keys are prefixed `stt_model.*` and `tts_model.*`.
+The checkpoint is a single `model.safetensors` file (44,382,749,892 bytes, FP32) holding **1632
+tensors**: 997 prefixed `stt_model.*`, 635 prefixed `tts_model.*`, and nothing unprefixed. The
+"two-model composition" is purely that naming convention — see
+[CODE_WALKTHROUGH.md §8](CODE_WALKTHROUGH.md#8-the-released-checkpoint--and-how-the-training-stack-is-reconstructed)
+for the full accounting and for which of the release's config values our yaml must mirror.
 
 ### 2. Extract STT Weights
 
@@ -149,8 +153,8 @@ Expected output: **10.10B** params for STT, **1.00B** for TTS.
 
 ```bash
 python scripts/remap_checkpoint_for_lora.py \
-    --src /data/checkpoints/stt_extracted \
-    --dst /data/checkpoints/stt_extracted_lora
+    --checkpoint /data/checkpoints/stt_extracted \
+    --output     /data/checkpoints/stt_extracted_lora
 ```
 
 `DuplexSTTModel.__init__` installs LoRA (`duplex_stt_model.py` ~L313) *before* it loads
@@ -318,13 +322,19 @@ trainer:
 
 ## Key Code Locations in the NeMo Repo
 
+> For a full guided walkthrough of how this code actually works — the four-channel timeline, the
+> fusion module, the function-call insertion mechanism, the loss masks, and the traps in each —
+> see **[CODE_WALKTHROUGH.md](CODE_WALKTHROUGH.md)**. The table below is just an index.
+
 | What | Path | Key Lines |
 |------|------|-----------|
 | STT model class | `nemo/collections/speechlm2/models/duplex_stt_model.py` | L179 (class), L231 (Nemotron handling), L321 (checkpoint loading), L2313 (training_step) |
 | Combined model | `nemo/collections/speechlm2/models/nemotron_voicechat.py` | L184 (init), L235 (checkpoint loading) |
 | LoRA utility | `nemo/collections/speechlm2/parts/lora.py` | `maybe_install_lora()` |
 | Pretrained utils | `nemo/collections/speechlm2/parts/pretrained.py` | `load_pretrained_hf()`, `setup_speech_encoder()` |
-| Dataset class | `nemo/collections/speechlm2/data/s2s_duplex_dataset.py` | Batch format |
+| Dataset class | `nemo/collections/speechlm2/data/s2s_dataset.py` | L585 (class), L1232 (`__getitem__`, batch format), L1593 (function-call gate) |
+| Channel fusion | `nemo/collections/speechlm2/parts/fusion.py` | L93 (`AddFusion.forward` — the architecture) |
+| Label time-shifts | `nemo/collections/speechlm2/parts/label_prep.py` | L64 (`prepare_labels`) |
 | 1.1B training config | `examples/speechlm2/conf/s2s_duplex_stt.yaml` | Template for our 11B config |
 | 11B inference config | `examples/speechlm2/conf/nemotron-labs-voicechat.yaml` | Architecture params |
 | Training entry point | `examples/speechlm2/s2s_duplex_stt_train.py` | Launch script |

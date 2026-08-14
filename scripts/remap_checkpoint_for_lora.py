@@ -8,9 +8,17 @@ pretrained_s2s_model (line ~321). peft renames every LLM parameter —
 and for LoRA-targeted projections also inserts .base_layer —
   ...mixer.q_proj.weight             ->  ...mixer.q_proj.base_layer.weight
 The loader copies tensors by exact key match, so with a checkpoint extracted from the
-released HF model NONE of the 339 LLM tensors match. It logs a warning and silently leaves
-the whole 7.75B backbone at random init. This script closes that gap up front, so the
-documented launch command works unchanged.
+released HF model NONE of the 339 LLM tensors match, and the whole 7.75B backbone silently
+keeps whatever load_pretrained_hf gave it -- base Nemotron-Nano-9B-v2 weights when
+pretrained_weights=true (our config), random init when false. Either way it is not the
+VoiceChat-finetuned backbone.
+
+Worse, this is nearly invisible: the loader iterates over CHECKPOINT keys, so its warning
+("Keys in checkpoint but not in model: N keys") reports the checkpoint's orphans. A model
+parameter that receives nothing is never logged at all. Use verify_checkpoint_load.py, which
+checks both directions.
+
+This script closes that gap up front, so the documented launch command works unchanged.
 
 The mapping is not hand-written: we instantiate the model from the same config, then map
 each model key back through the peft renaming to find its checkpoint counterpart. Whatever
