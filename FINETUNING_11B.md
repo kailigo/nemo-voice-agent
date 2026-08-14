@@ -13,12 +13,22 @@ We want to finetune NVIDIA's Nemotron VoiceChat 11B (STT component) on tau2-benc
 
 ## Source Repo
 
+One repo, one branch. `nemotron-labs-voicechat` is a fork of NVIDIA's NeMo Speech
+`nemotron-labs-voicechat` branch (it contains upstream commit `097dfe9`), so upstream's
+`nemo/` and `examples/` sit in the same tree as our finetuning scripts and config:
+
 ```bash
-git clone https://github.com/NVIDIA-NeMo/Speech.git --branch nemotron-labs-voicechat nemotron-voicechat
-cd nemotron-voicechat
+git clone https://github.com/kailigo/nemo-voice-agent.git
+cd nemo-voice-agent          # nemotron-labs-voicechat is the default branch
+pip install -e . --no-deps --no-build-isolation
 ```
 
-Our custom scripts live in `scripts/` within this clone. They are:
+There used to be a second directory (`code/nemotron-voicechat`, a shallow clone of upstream)
+with absolute symlinks pointing back here. It was redundant — this branch is a strict superset
+— and the symlinks were version-controlled nowhere, so it has been removed. If you see a
+reference to it anywhere, it means that text predates the consolidation.
+
+Our custom scripts live in `scripts/` alongside upstream's. They are:
 
 | Script | Purpose |
 |--------|---------|
@@ -39,7 +49,7 @@ Commands below use generic `/data/...` paths. On the current 8× H200 box they a
 
 | Generic | Actual |
 |---------|--------|
-| repo clone | `/fsx/home/kai.li/code/nemotron-voicechat` |
+| repo clone | `/fsx/home/kai.li/code/nemo-voice-agent` (branch `nemotron-labs-voicechat`) |
 | conda env | `/fsx/home/kai.li/miniforge3/envs/voicechat` (`conda activate voicechat`) |
 | `/data/checkpoints/voicechat-11b` | `/fsx/home/kai.li/data/voicechat/voicechat-11b` |
 | `/data/checkpoints/stt_extracted_lora` | `/fsx/home/kai.li/data/voicechat/stt_extracted_lora` ← **use this one** |
@@ -420,7 +430,7 @@ The finetuned LoRA weights can be merged back or loaded alongside the base model
 These files need to exist on the GPU machine:
 
 ```
-nemotron-voicechat/                          # git clone of NeMo Speech
+nemo-voice-agent/                            # fork of NeMo Speech (branch nemotron-labs-voicechat)
 ├── scripts/
 │   ├── extract_stt_checkpoint.py            # OUR SCRIPT
 │   ├── remap_checkpoint_for_lora.py         # OUR SCRIPT (mandatory, see Step 2b)
