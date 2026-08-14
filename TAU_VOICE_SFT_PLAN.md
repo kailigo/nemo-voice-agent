@@ -96,20 +96,89 @@ Everything below was measured on 2026-08-14, not inferred. Cited so it can be re
 `scripts/episodes_to_nemotron_training.py::extract_tool_schemas` reconstructs schemas from
 observed calls only. Measured on `0_4922ce6f`:
 
-- **5 tools advertised; retail has 16.** (airline 14, telecom 21.)
-- **Zero `description` fields**, on tools or parameters. Real retail `tools.py` docstrings are
-  10,588 chars ≈ 2,650 tokens.
+- **5 tools advertised; retail has 16.** (airline 14, telecom 13 — counted from the registry via
+  `export_tool_schemas.py`, not by grepping `def`, which over-counts helpers.)
+- **Zero `description` fields**, on tools or parameters. The correct retail tool block is 2,906
+  tokens against the 5-tool reconstruction's ~275.
 - `required` lists every observed argument, so optional params are marked required. The schema is
   *wrong*, not merely thin.
+
+The fix is not to parse docstrings ourselves: `Tool.openai_schema`
+(`tau-voice-2/src/tau2/environment/tool.py:140`) already emits exactly the shape our converter
+writes, built from the real signature and docstring. `export_tool_schemas.py` dumps it to a JSON
+sidecar; all 15 loadable domains have descriptions on every tool.
 
 **Model**
 
 - `target_audio` is only "saved for debugging" (`duplex_stt_model.py:651`), never a loss target.
   Agent-track audio quality is irrelevant to STT training.
 - `max_fc_total_tokens: 8000` (`examples/speechlm2/conf/finetune/s2s_duplex_stt_11b.yaml:122`)
-  **drops the whole cut**, it does not truncate. Current FC totals ≈ 5.0–5.2 K.
+  **drops the whole cut**, it does not truncate. See §2b — this is now the confirmed blocker for
+  arm B.
 - Trainable: 2.41 B of 10.13 B (see memory `stt-11b-trainable-params`). `perception` (0.61 B) is
   trainable, which is what makes telephony adaptation possible.
+
+## 2b. The FC token budget — measured 2026-08-14, and it blocks arm B
+
+Reproduce with:
+
+```bash
+# in tau-voice-2 (needs its own venv: python -m venv .venv && .venv/bin/pip install -e .)
+.venv/bin/python scripts/export_tool_schemas.py --output data/tool_schemas.json
+# in nemo-voice-agent, voicechat env
+python scripts/measure_fc_token_budget.py \
+    --shards /fsx/home/kai.li/data/voicechat/tau2_fixed/shards \
+    --tool_schemas /fsx/home/kai.li/code/tau-voice-2/data/tool_schemas.json
+```
+
+**What counts** (replicated from `_get_fc_cut_total_prompt_tokens`): `1 + tokens(system_prompt) +
+1`, plus every segment of `supervisions[1:]`. Critical trap:
+`seg_text = (custom.get("function") or sup.text or "")` — with the mandatory
+`custom={"function": ""}` on speech turns the empty string is falsy, so it falls through to
+`sup.text`. **The whole conversation transcript counts toward the FC budget**, not just tool-call
+strings.
+
+**Today the 3 cuts fit; with correct schemas all three are dropped.**
+
+| cut | system | segments | total | vs 8000 |
+|---|---|---|---|---|
+| `0_4922ce6f` | 1,697 | 4,618 | 6,315 | OK |
+| same, full 16-tool retail schema | **4,328** | 4,618 | **8,946** | **DROPPED** |
+
+The other two behave identically (8,649 and 8,766). Per-domain system-prompt cost against a
+4,618-token transcript allowance:
+
+| domain | tools | policy | schema | system | headroom |
+|---|---|---|---|---|---|
+| telecom | 13 | 5,382 | 1,519 | 6,903 | **−3,521** |
+| retail | 16 | 1,420 | 2,906 | 4,328 | **−946** |
+| airline | 14 | 1,672 | 2,582 | 4,256 | **−874** |
+| 11 new domains | 9–10 | 603–1,216 | 1,138–1,730 | 1,858–2,705 | +677 … +1,524 |
+
+So: **all three test domains overflow, every new domain fits.** Arm C's *training* data is
+unaffected (new domains only), but **arm B is impossible until this is fixed**, and it would fail
+silently. Note the new domains' headroom is only 677–1,524 tokens, so longer conversations there
+will overflow too.
+
+**Where the tokens are.** Tool responses are **84 %** of segment cost (3,861 of 4,618); all speech
+is 396. So compression targets responses, not transcripts. Largest single response is 1,498 tokens
+— `get_product_details` dumping every variant of a product.
+
+**One lossless win, and it is not enough alone.** `content` is *double-encoded* JSON (a JSON string
+containing escaped JSON), and `format_tool_response` uses default `json.dumps` separators while the
+tool block uses compact ones. Measured over all 3 cuts:
+
+| | tokens | saved |
+|---|---|---|
+| as generated today | 11,083 | — |
+| compact separators | 11,067 | 0.1 % |
+| + un-double-encoded `content` | 9,052 | **18.3 %** |
+
+That is **677 tokens/cut, lossless** — but retail's gap is 946, so it closes airline and retail
+only in combination with a budget raise. Recommendation: apply the lossless fix **and** raise
+`max_fc_total_tokens` to ~12,000 (covers telecom's worst case). The raise is the one item here
+that needs a GPU to validate: it lengthens the LLM sequence (a 200 s conversation is ~2,500 audio
+frames at 12.5 Hz plus the FC tokens), so memory must be re-checked before trusting it.
 
 **Task inventory**
 
@@ -185,19 +254,25 @@ This also tells us which failures dominate, which should re-prioritise everythin
 
 All CPU-only. In `nemo-voice-agent/scripts/episodes_to_nemotron_training.py` unless noted.
 
-**1a. Real tool schemas (highest priority).** Load the full tool list from the tau2 domain
-registry instead of reconstructing from observed calls: every tool in the domain, real
-descriptions from the docstrings, correct `required` vs optional, enums. Without this, training
-teaches "call what's in the prompt" and the cross-domain arm C measures nothing — tool
-*selection* from an unfamiliar 21-tool menu is precisely the capability under test.
+**1a. Real tool schemas (highest priority).** DONE on the export side:
+`tau-voice-2/scripts/export_tool_schemas.py` writes `data/tool_schemas.json` for all 15 loadable
+domains from `Tool.openai_schema`. Remaining: teach `episodes_to_nemotron_training.py` to take
+`--tool_schemas <json>` and select by the episode's domain (recorded as `RunConfig.domain`,
+`simulation.py:276`) instead of calling `extract_tool_schemas`. Without this, training teaches
+"call what's in the prompt" and arm C measures nothing — tool *selection* from an unfamiliar
+13–16-tool menu is precisely the capability under test.
 
-**1b. Compress tool-response JSON.** Load-bearing, because 1a does not fit in
-`max_fc_total_tokens: 8000` without it (adding ~2,650 tokens of retail descriptions plus 11 more
-tool entries to a ~5.1 K baseline). Drop unused fields, elide long list bodies.
+**1b. Compress tool responses.** Load-bearing: 1a costs +2,631 system-prompt tokens on retail and
+drops all 3 cuts (§2b). Do the lossless parts first — un-double-encode `content` (−18.3 %, 677
+tokens/cut) and use compact separators in `format_tool_response`. Responses are 84 % of segment
+cost, so this is the only place worth compressing. If more is needed, elide long variant/list
+bodies — but note the agent must still pick the right variant, so this is genuinely lossy and
+should be measured against task success, not just token count.
 
-**1c. Instrument the drop.** Log `fc_drop_info` per domain and fail loudly. The drop scales with
-domain size (telecom: 21 tools), so cuts are lost **non-uniformly by domain** and silently. Raise
-`max_fc_total_tokens` if 1b is insufficient — but only after measuring.
+**1c. Raise `max_fc_total_tokens` to ~12,000 and turn on `fc_log`.** 1b alone does not close
+telecom's −3,521. The raise needs a GPU memory re-check (§2b), so land 1b first and treat the
+raise as gated. Log drops per domain and fail loudly: the loss is **non-uniform by domain** and
+currently invisible.
 
 **1d. Compress inter-turn dead air.** Shift timestamps and cut silence from both waveforms in
 inter-turn gaps, targeting 0.3–0.8 s. Exact (both tracks are silent there), needs no TTS,
@@ -304,7 +379,7 @@ the released 11B was trained with these unfrozen, so freezing changes the recipe
 | 2 | Truncated tool schemas invalidate arm C | high | Phase 1a |
 | 3 | Cloning teacher latency hurts scored metrics | high | Phase 1d |
 | 4 | Too few tasks → too little data | high | Phase 3, ~50–100 tasks/domain |
-| 5 | `max_fc_total_tokens` drops cuts non-uniformly per domain, silently | medium | Phase 1b + 1c |
+| 5 | `max_fc_total_tokens` drops cuts non-uniformly per domain, silently — **confirmed: correct schemas drop 100 % of retail/airline/telecom cuts, blocking arm B** | **high** | Phase 1b + 1c, §2b |
 | 6 | `yield_rate` untrainable from 1 barge-in example | medium | Phase 3 over-sampling |
 | 7 | New domains are stylistic clones → optimistic transfer | medium | deliberate diversity in authoring |
 | 8 | Overfitting / forgetting policy-following ability | medium | Phase 4 mitigations |
@@ -323,6 +398,22 @@ the released 11B was trained with these unfrozen, so freezing changes the recipe
 4. Should arm B hold out tasks or trials? Task-level is cleaner but shrinks airline (50 tasks).
 
 ---
+
+## Appendix — state of the world on this box (2026-08-14)
+
+- **The raw episode artifacts are gone.** No `tau-voice-2/data/simulations`, and a filesystem-wide
+  search for `both.wav` found nothing. Only the built Shar survives
+  (`/fsx/home/kai.li/data/voicechat/tau2_fixed/`). So the 3 existing cuts **cannot be regenerated**
+  with corrected schemas — they can only be repaired in place (`system_prompt` is a plain field in
+  `cut.custom`, so a rewrite touches no audio; precedent: `scripts/repair_tau2_shards.py`) or
+  re-collected. Keep raw artifacts from here on.
+- `tau-voice-2/.venv` now exists (`pip install -e .`, tau2 1.0.1, Python 3.12.13) and
+  `.venv/bin/tau2` works. `.venv` is gitignored.
+- `banking_knowledge` fails to export (`ModuleNotFoundError: rank_bm25`); the other 15 domains
+  export cleanly. Install `rank_bm25` if that domain is ever needed.
+- /fsx has 23 G free (76 % used) — the "96 % full" note in older memory is stale.
+- New tooling: `tau-voice-2/scripts/export_tool_schemas.py`,
+  `nemo-voice-agent/scripts/measure_fc_token_budget.py`.
 
 ## Appendix — pointers
 
