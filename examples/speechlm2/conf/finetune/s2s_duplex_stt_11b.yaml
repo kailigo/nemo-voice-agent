@@ -90,6 +90,37 @@ model:
   # Function calling head
   use_function_head: true
 
+  # Wrap a tools-only system prompt with the full FC instruction preamble. The released 11B's
+  # config.json sets this true and the NeMo default is false, so omitting it is a silent
+  # behaviour change — the same trap as duplex_function_channel_weight below.
+  # It matters for our tau2 data specifically: those cuts carry
+  # <AVAILABLE_TOOLS>[...]</AVAILABLE_TOOLS> in cut.custom['system_prompt'] but never the phrase
+  # "If you decide to call any tool", which is exactly what _fc_system_prompt_needs_augment
+  # (s2s_dataset.py ~L301) tests for. So the model is told WHICH tools exist but never the
+  # <TOOLCALL>/<TOOL_RESPONSE> output format it is supposed to emit. Turning this on prepends
+  # DEFAULT_FC_SYSTEM_PROMPT_TEMPLATE, which states the format explicitly.
+  # Costs ~145 extra prompt tokens per cut (measured: 1697 -> 1842).
+  augment_fc_system_prompt: true
+
+  # Budget for system prompt + ALL function-call/response segments; cuts over it are DROPPED
+  # (s2s_dataset.py ~L1294, logs "[FC] Filtered N cuts over max_fc_total_tokens").
+  #
+  # DO NOT copy the released 11B's value of 3000 here. Measured with the real Nemotron tokenizer,
+  # our 3 tau2 sample cuts score 6460 / 6127 / 6243 with augmentation on — every one is ~2x over
+  # 3000, so matching the release would silently discard 100% of the data and train on nothing.
+  # tau2 conversations are long (157-211 s) and their <TOOL_RESPONSE> payloads are big raw JSON
+  # order dumps (one is 1498 tokens by itself), which is simply a different data distribution
+  # from whatever the release was tuned on.
+  #
+  # 8000 keeps all current samples with headroom while still filtering pathological cuts.
+  # NOTE ON MEMORY, UNMEASURED: this knob indirectly bounds sequence length. The function channel
+  # is built by INSERTION, which expands the sequence rather than overwriting the audio grid
+  # (duplex_stt_model.py ~L1060), so a cut costs roughly
+  # prompt_tokens + duration/frame_length + inserted_fc_tokens ~= 1842 + 2632 + 3894 ~= 8.4k
+  # positions. The 8xH200 run that measured 46 GB/GPU used ~300-frame synthetic cuts, i.e. ~28x
+  # shorter. Expect to drop train_ds.batch_size to 1 if this OOMs.
+  max_fc_total_tokens: 8000
+
   # Fusion method for combining audio + text embeddings. These are ARCHITECTURAL scalars,
   # not loss weights: create_fusion_module multiplies each channel's embedding by its weight
   # before summing them (duplex_stt_model.py ~296). They must therefore match the values the
