@@ -112,14 +112,31 @@ model:
   # order dumps (one is 1498 tokens by itself), which is simply a different data distribution
   # from whatever the release was tuned on.
   #
-  # 8000 keeps all current samples with headroom while still filtering pathological cuts.
+  # 8000 was sized against the ORIGINAL shards, whose tool block was reconstructed from the
+  # calls each episode happened to make: 4-5 retail tools, no descriptions. Advertising the real
+  # 16-tool retail schema (scripts/repair_tau2_fc_prompt.py) costs ~+2000 tokens, and the
+  # canonical cuts then score 8389 / 8137 / 8254 with augmentation on — ALL THREE over 8000, so
+  # 8000 would now silently discard 100% of the corrected data.
+  #
+  # 12000 leaves ~3.6-3.9k of headroom on retail and is the smallest round value that also clears
+  # telecom, whose system prompt alone is 6903 tokens (policy 5382 + schema 1519) against a
+  # ~3.9k transcript allowance. Per-domain numbers: scripts/measure_fc_token_budget.py.
+  #
   # NOTE ON MEMORY, UNMEASURED: this knob indirectly bounds sequence length. The function channel
   # is built by INSERTION, which expands the sequence rather than overwriting the audio grid
-  # (duplex_stt_model.py ~L1060), so a cut costs roughly
-  # prompt_tokens + duration/frame_length + inserted_fc_tokens ~= 1842 + 2632 + 3894 ~= 8.4k
-  # positions. The 8xH200 run that measured 46 GB/GPU used ~300-frame synthetic cuts, i.e. ~28x
-  # shorter. Expect to drop train_ds.batch_size to 1 if this OOMs.
-  max_fc_total_tokens: 8000
+  # (duplex_stt_model.py ~L1060), so a canonical retail cut costs roughly
+  # prompt_tokens + duration/frame_length + inserted_fc_tokens ~= 4478 + 2495 + 3909 ~= 10.9k
+  # positions, up from the ~8.4k the truncated prompts implied. The 8xH200 run that measured
+  # 46 GB/GPU used ~300-frame synthetic cuts, i.e. ~36x shorter. Expect to drop
+  # train_ds.batch_size to 1 if this OOMs. THIS VALUE IS NOT YET VALIDATED ON GPU.
+  max_fc_total_tokens: 12000
+
+  # Log which cuts get dropped by max_fc_total_tokens, and their token counts. Off by default,
+  # which is how the original 8000 silently discarding data would have gone unnoticed. The drop
+  # is biased toward the longest, most tool-call-rich, most expensive-to-collect trajectories,
+  # and it scales with the domain's policy length — so a whole domain can be nearly absent from
+  # training while the run looks healthy. Keep this on.
+  fc_log: true
 
   # Fusion method for combining audio + text embeddings. These are ARCHITECTURAL scalars,
   # not loss weights: create_fusion_module multiplies each channel's embedding by its weight

@@ -20,7 +20,14 @@ Usage:
   python scripts/episodes_to_nemotron_training.py \
       --sim_dir data/simulations \
       --output /tmp/tau2_nemotron_training \
-      --min_reward 1.0
+      --min_reward 1.0 \
+      --tool_schemas ../tau-voice-2/data/tool_schemas.json
+
+ALWAYS PASS --tool_schemas. Without it the tool block is reconstructed from the calls the
+teacher happened to make (see extract_tool_schemas), which advertises only the tools the
+model is about to call, with no descriptions -- teaching "call what's in the prompt"
+instead of tool selection, and quietly invalidating the cross-domain experiment. Generate
+the sidecar with tau-voice-2/scripts/export_tool_schemas.py.
 """
 
 import argparse
@@ -86,6 +93,14 @@ def discover_episodes(sim_dir: str) -> list[dict]:
         if not sim_index:
             continue
 
+        # The domain is recorded once per run, unconditionally, in EnvironmentInfo
+        # (tau-voice-2/src/tau2/environment/environment.py:27). Its sibling `tool_defs` is
+        # only populated when get_info(include_tool_info=True), which the orchestrator does
+        # not pass -- hence the schema sidecar rather than reading schemas from here.
+        env_info = (results.get("info") or {}).get("environment_info") or {}
+        domain = env_info.get("domain_name")
+        run_policy = env_info.get("policy", "")
+
         for sim_entry in sim_index:
             sim_id = sim_entry["id"]
             task_id = sim_entry["task_id"]
@@ -106,6 +121,8 @@ def discover_episodes(sim_dir: str) -> list[dict]:
                 "termination_reason": sim_entry.get("termination_reason"),
                 "audio_dir": str(audio_dir),
                 "sim_json_path": str(sim_json) if sim_json.exists() else None,
+                "domain": domain,
+                "run_policy": run_policy,
             })
 
     return episodes
@@ -149,11 +166,31 @@ def extract_tool_interactions(sim_data: dict) -> list[dict]:
     return interactions
 
 
+def load_tool_schemas(path: str | None) -> dict:
+    """Load the per-domain schema sidecar written by tau-voice-2/scripts/export_tool_schemas.py.
+
+    Shape: {"<domain>": {"tools": [<openai_schema>], "policy": str, "n_tools": int, ...}}.
+    Returns {} when no path is given, so the caller falls back to extract_tool_schemas.
+    """
+    if not path:
+        return {}
+    with open(path) as f:
+        schemas = json.load(f)
+    print(f"  Tool schemas: {len(schemas)} domain(s) from {path}")
+    for name in sorted(schemas):
+        print(f"    {name:20s} {schemas[name]['n_tools']:3d} tools")
+    return schemas
+
+
 def extract_tool_schemas(sim_data: dict) -> list[dict]:
     """
-    Extract tool schemas from the tool calls seen in the simulation.
-    Since tau2 doesn't store schemas in the sim JSON, we reconstruct
-    minimal OpenAI-format schemas from the observed calls.
+    FALLBACK ONLY -- prefer the --tool_schemas sidecar. See the module docstring.
+
+    Extract tool schemas from the tool calls seen in the simulation. Since the sim JSON does
+    not carry schemas (EnvironmentInfo.tool_defs is None unless include_tool_info=True), we
+    reconstruct minimal OpenAI-format schemas from the observed calls. That is lossy in three
+    ways that matter: only the called tools appear (5 of retail's 16), there are no
+    descriptions, and every observed argument is marked required.
     """
     seen = {}
     for tick in sim_data.get("ticks", []):
@@ -204,13 +241,42 @@ def format_toolcall(name: str, arguments: dict) -> str:
     return f"<TOOLCALL>{json.dumps(call_obj)}</TOOLCALL>"
 
 
-def format_tool_response(content: str) -> str:
-    """Format a tool response in TOOL_RESPONSE tags."""
-    resp_obj = [{"content": content}]
-    return f"<TOOL_RESPONSE>{json.dumps(resp_obj)}</TOOL_RESPONSE>"
+def format_tool_response(content: str, unnest: bool = True) -> str:
+    """Format a tool response in TOOL_RESPONSE tags.
+
+    tau2 tool results arrive as JSON *strings*. Wrapping one in {"content": <str>} and
+    re-encoding escapes every quote, so the payload is JSON-encoded twice for no added
+    information. Measured over the 3 prototype cuts, that double encoding costs ~677 tokens
+    per cut -- 18.3% of their total FC prompt tokens -- and tool responses are 84% of all
+    segment cost (scripts/measure_fc_token_budget.py). Parsing the string back and letting
+    json.dumps emit it once is lossless.
+
+    Only dict/list payloads are un-nested. A bare "123" or "true" would parse to an int/bool
+    and silently change type, and plain-text results (error messages) are not JSON at all --
+    both keep the string form.
+
+    Note the asymmetry with format_toolcall, which deliberately keeps default separators:
+    tool calls are what the model *generates*, so their surface form is a learned target and
+    not worth perturbing to save ~0 tokens. Responses are what the model *reads*.
+    """
+    payload = content
+    if unnest and isinstance(content, str) and content.strip():
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            payload = parsed
+    resp_obj = [{"content": payload}]
+    return f"<TOOL_RESPONSE>{json.dumps(resp_obj, separators=(',', ':'))}</TOOL_RESPONSE>"
 
 
-def build_training_cut(episode: dict, output_dir: str):
+def build_training_cut(
+    episode: dict,
+    output_dir: str,
+    tool_schemas_by_domain: dict | None = None,
+    unnest_responses: bool = True,
+):
     """
     Build a Lhotse MonoCut with full FC training format from an episode.
     """
@@ -248,9 +314,24 @@ def build_training_cut(episode: dict, output_dir: str):
         with open(episode["sim_json_path"]) as f:
             sim_data = json.load(f)
 
-    policy = sim_data.get("policy", "")
+    # Prefer the run's own policy (a run may override the domain default); fall back to the
+    # one recorded in EnvironmentInfo.
+    policy = sim_data.get("policy") or episode.get("run_policy") or ""
     tool_interactions = extract_tool_interactions(sim_data)
-    tool_schemas = extract_tool_schemas(sim_data)
+
+    # Canonical schemas from the sidecar, keyed by the episode's domain. The lossy
+    # reconstruction is the fallback and says so loudly, because a silent fallback is exactly
+    # how the truncated 5-tool retail prompt got into the prototype shards.
+    domain = episode.get("domain")
+    schemas_by_domain = tool_schemas_by_domain or {}
+    if domain and domain in schemas_by_domain:
+        tool_schemas = schemas_by_domain[domain]["tools"]
+        episode["schema_source"] = f"sidecar:{domain}"
+    else:
+        tool_schemas = extract_tool_schemas(sim_data)
+        why = "no --tool_schemas given" if not schemas_by_domain else f"domain {domain!r} not in sidecar"
+        print(f"\n    [WARN] reconstructing {len(tool_schemas)} schemas from observed calls ({why})")
+        episode["schema_source"] = "reconstructed"
 
     # Build system prompt with tools
     system_prompt = format_system_prompt_with_tools(policy, tool_schemas)
@@ -332,7 +413,7 @@ def build_training_cut(episode: dict, output_dir: str):
         sup_idx += 1
 
         # Tool response (to agent)
-        response_text = format_tool_response(tc["result"])
+        response_text = format_tool_response(tc["result"], unnest=unnest_responses)
         fc_supervisions.append(SupervisionSegment(
             id=f"{cut_id}_sup_{sup_idx:03d}",
             recording_id=user_recording.id,
@@ -445,6 +526,19 @@ def main():
         help="Cuts per shard. Shard count caps data-parallel width, so keep it low enough that "
         "num_cuts/shard_size >= your GPU count (default 1 = one cut per shard).",
     )
+    parser.add_argument(
+        "--tool_schemas",
+        default=None,
+        help="JSON sidecar of canonical per-domain tool schemas, from "
+        "tau-voice-2/scripts/export_tool_schemas.py. Strongly recommended: without it the "
+        "tool block is reconstructed from observed calls only (lossy -- see module docstring).",
+    )
+    parser.add_argument(
+        "--no_unnest_responses",
+        action="store_true",
+        help="Keep tool-response payloads double JSON-encoded (the old behaviour). Costs ~18%% "
+        "more FC prompt tokens for no information; only useful for reproducing old shards.",
+    )
     parser.add_argument("--dry_run", action="store_true", help="Just discover episodes")
     args = parser.parse_args()
 
@@ -454,6 +548,14 @@ def main():
     print(f"  sim_dir: {args.sim_dir}")
     print(f"  output: {args.output}")
     print(f"  min_reward: {args.min_reward}")
+
+    tool_schemas_by_domain = load_tool_schemas(args.tool_schemas)
+    if not tool_schemas_by_domain:
+        print(
+            "  [WARN] no --tool_schemas: tool blocks will be reconstructed from observed\n"
+            "         calls, which advertises only the tools each episode happens to call,\n"
+            "         with no descriptions. See the module docstring."
+        )
 
     # Discover
     print("\nDiscovering episodes...")
@@ -465,7 +567,13 @@ def main():
 
     if args.dry_run:
         for ep in passing:
-            print(f"    task={ep['task_id']} sim={ep['sim_id'][:8]} reward={ep['reward']}")
+            print(
+                f"    task={ep['task_id']} sim={ep['sim_id'][:8]} reward={ep['reward']} "
+                f"domain={ep.get('domain')}"
+            )
+        missing = sorted({e.get("domain") for e in passing} - set(tool_schemas_by_domain))
+        if missing and tool_schemas_by_domain:
+            print(f"  [WARN] domains absent from the sidecar: {missing}")
         return
 
     if not passing:
@@ -478,7 +586,12 @@ def main():
     for i, episode in enumerate(passing):
         print(f"  [{i+1}/{len(passing)}] task={episode['task_id']} sim={episode['sim_id'][:8]}...", end=" ")
         try:
-            cut = build_training_cut(episode, args.output)
+            cut = build_training_cut(
+                episode,
+                args.output,
+                tool_schemas_by_domain=tool_schemas_by_domain,
+                unnest_responses=not args.no_unnest_responses,
+            )
             valid, msg = validate_training_cut(cut)
             if valid:
                 cuts.append(cut)
@@ -518,6 +631,12 @@ def main():
         "min_reward_filter": args.min_reward,
         "format": "nemotron_voicechat_duplex_s2s_fc",
         "shar_path": shar_dir,
+        # Provenance: which domains are in here, and whether the tool blocks are canonical.
+        # A cut built with reconstructed schemas is not usable for the cross-domain arm.
+        "domains": sorted({e.get("domain") for e in passing if e.get("domain")}),
+        "tool_schemas_sidecar": args.tool_schemas,
+        "schema_sources": sorted({e.get("schema_source") for e in passing if e.get("schema_source")}),
+        "unnest_tool_responses": not args.no_unnest_responses,
     }
     with open(os.path.join(args.output, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)

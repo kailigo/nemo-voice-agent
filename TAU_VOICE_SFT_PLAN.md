@@ -254,25 +254,34 @@ This also tells us which failures dominate, which should re-prioritise everythin
 
 All CPU-only. In `nemo-voice-agent/scripts/episodes_to_nemotron_training.py` unless noted.
 
-**1a. Real tool schemas (highest priority).** DONE on the export side:
-`tau-voice-2/scripts/export_tool_schemas.py` writes `data/tool_schemas.json` for all 15 loadable
-domains from `Tool.openai_schema`. Remaining: teach `episodes_to_nemotron_training.py` to take
-`--tool_schemas <json>` and select by the episode's domain (recorded as `RunConfig.domain`,
-`simulation.py:276`) instead of calling `extract_tool_schemas`. Without this, training teaches
-"call what's in the prompt" and arm C measures nothing — tool *selection* from an unfamiliar
-13–16-tool menu is precisely the capability under test.
+**1a. Real tool schemas (highest priority). DONE.** `tau-voice-2/scripts/export_tool_schemas.py`
+writes `data/tool_schemas.json` for all 15 loadable domains from `Tool.openai_schema`.
+`episodes_to_nemotron_training.py` now takes `--tool_schemas <json>` and selects by the episode's
+domain, read from `info.environment_info.domain_name` in `results.json` — which is populated
+unconditionally, unlike its sibling `tool_defs` (only set when `get_info(include_tool_info=True)`,
+which the orchestrator never passes; hence the sidecar). Falling back to the lossy
+`extract_tool_schemas` now prints a `[WARN]`, and `metadata.json` records `schema_sources` so a
+corpus built from reconstructed schemas is identifiable after the fact. Without this, training
+teaches "call what's in the prompt" and arm C measures nothing — tool *selection* from an
+unfamiliar 13–16-tool menu is precisely the capability under test.
 
-**1b. Compress tool responses.** Load-bearing: 1a costs +2,631 system-prompt tokens on retail and
-drops all 3 cuts (§2b). Do the lossless parts first — un-double-encode `content` (−18.3 %, 677
-tokens/cut) and use compact separators in `format_tool_response`. Responses are 84 % of segment
-cost, so this is the only place worth compressing. If more is needed, elide long variant/list
-bodies — but note the agent must still pick the right variant, so this is genuinely lossy and
-should be measured against task success, not just token count.
+**1b. Compress tool responses. DONE (lossless part).** `format_tool_response` now un-nests
+dict/list payloads and emits compact separators; `format_toolcall` is deliberately unchanged,
+since tool calls are what the model *generates* and their surface form is a learned target, while
+responses are only what it *reads*. Scalars and non-JSON results keep the string form, so a bare
+`"123"` never silently becomes an int. Measured saving: **662–707 tokens/cut**, matching the
+677 estimate. Responses are 84 % of segment cost, so this is the only place worth compressing. If
+more is needed, elide long variant/list bodies — but the agent must still pick the right variant,
+so that is genuinely lossy and must be measured against task success, not token count.
 
-**1c. Raise `max_fc_total_tokens` to ~12,000 and turn on `fc_log`.** 1b alone does not close
-telecom's −3,521. The raise needs a GPU memory re-check (§2b), so land 1b first and treat the
-raise as gated. Log drops per domain and fail loudly: the loss is **non-uniform by domain** and
-currently invisible.
+**1c. Raise `max_fc_total_tokens` to 12,000 and turn on `fc_log`. DONE in config, GPU-unvalidated.**
+Measured on the repaired shards with augmentation on: **8,389 / 8,137 / 8,254** — all three over
+8,000, so the old value would now discard 100 % of the corrected data. 1b's saving does not close
+the gap because 1a costs ~+2,000. 12,000 leaves 3.6–3.9k headroom on retail and is the smallest
+round value that also clears telecom (system prompt 6,903 alone). `fc_log: true` is now set —
+it defaults to `False`, which is exactly how 8,000 silently discarding everything would have gone
+unnoticed. **Still needs a GPU memory re-check:** a canonical retail cut is now ~10.9k sequence
+positions (4,478 prompt + 2,495 audio frames + 3,909 inserted FC), up from ~8.4k.
 
 **1d. Compress inter-turn dead air.** Shift timestamps and cut silence from both waveforms in
 inter-turn gaps, targeting 0.3–0.8 s. Exact (both tracks are silent there), needs no TTS,
@@ -401,19 +410,28 @@ the released 11B was trained with these unfrozen, so freezing changes the recipe
 
 ## Appendix — state of the world on this box (2026-08-14)
 
-- **The raw episode artifacts are gone.** No `tau-voice-2/data/simulations`, and a filesystem-wide
-  search for `both.wav` found nothing. Only the built Shar survives
-  (`/fsx/home/kai.li/data/voicechat/tau2_fixed/`). So the 3 existing cuts **cannot be regenerated**
-  with corrected schemas — they can only be repaired in place (`system_prompt` is a plain field in
-  `cut.custom`, so a rewrite touches no audio; precedent: `scripts/repair_tau2_shards.py`) or
-  re-collected. Keep raw artifacts from here on.
+- **The raw episode artifacts are gone, and it cost us almost nothing.** No
+  `tau-voice-2/data/simulations`, and a filesystem-wide search for `both.wav` found nothing. Only
+  the built Shar survives (`/fsx/home/kai.li/data/voicechat/tau2_fixed/`). The 3 cuts therefore
+  cannot be regenerated — but everything the fixes need is already in the Shar, so they were
+  **repaired in place** instead (`scripts/repair_tau2_fc_prompt.py` →
+  `/fsx/home/kai.li/data/voicechat/tau2_canonical/`, 4–5 tools → 16 documented, responses
+  single-encoded, both audio tracks and the timeline verified bit-identical, audio hardlinked so
+  the copy costs 30 KB). The only genuinely unrecoverable field is the tool-call *end* times from
+  `assistant_tool_calls_labels.txt`, and those gaps measured 0.0 s, so there is nothing in them.
+  Dead-air compression (1d) is also still doable from the Shar.
+  **Keep raw artifacts from here on anyway** — the next loss may not be this cheap.
 - `tau-voice-2/.venv` now exists (`pip install -e .`, tau2 1.0.1, Python 3.12.13) and
   `.venv/bin/tau2` works. `.venv` is gitignored.
 - `banking_knowledge` fails to export (`ModuleNotFoundError: rank_bm25`); the other 15 domains
   export cleanly. Install `rank_bm25` if that domain is ever needed.
 - /fsx has 23 G free (76 % used) — the "96 % full" note in older memory is stale.
 - New tooling: `tau-voice-2/scripts/export_tool_schemas.py`,
-  `nemo-voice-agent/scripts/measure_fc_token_budget.py`.
+  `nemo-voice-agent/scripts/measure_fc_token_budget.py`,
+  `nemo-voice-agent/scripts/repair_tau2_fc_prompt.py`.
+- **Train on `tau2_canonical/shards`, not `tau2_fixed/shards`**, and with
+  `max_fc_total_tokens: 12000`. The old pairing (`tau2_fixed` + 8,000) trains on truncated 4–5-tool
+  prompts; the new pairing at 8,000 trains on nothing at all.
 
 ## Appendix — pointers
 
