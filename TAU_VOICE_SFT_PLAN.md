@@ -205,6 +205,23 @@ to produce one.
 `DiscreteTimeAdapter` subclass with the abstract methods `connect`, `disconnect`,
 `is_connected`, `run_tick`, `_execute_tick`, `_flush_pending_tool_results`.
 
+The template method fits, despite every existing provider being a remote WebSocket API and NeMo
+being local and in-process. `_async_run_tick` (`adapter.py:215-292`) already handles tool-result
+flushing, audio capping via `buffer_excess_audio`, barge-in, and cumulative state; only
+`_execute_tick` and `_flush_pending_tool_results` are ours. Follow the directory convention in
+`src/tau2/voice/audio_native/AGENTS.md` (`provider.py` / `events.py` /
+`discrete_time_adapter.py`), and reuse `StreamingTelephonyConverter` from `audio_converter.py`
+rather than writing a converter — the adapter must emit 8 kHz μ-law and consume 16 kHz float.
+
+Two contract details worth getting right up front:
+- Populate `self._utterance_transcripts[item_id]` and tag each audio chunk with that `item_id`, or
+  `get_proportional_transcript` (`tick_result.py:463`) silently returns `""` and the transcript is
+  empty. Use one `item_id` per agent utterance, minted on the first frame after a yield.
+- We know exactly which text belongs to which tick (we decode per frame), so the proportional
+  redistribution is unnecessary but harmless — it is driven by byte ratios within an utterance.
+- Signal barge-in with `result.truncate_agent_audio(...)` (`tick_result.py:315`); `LiveKit` is the
+  precedent for a non-WebSocket provider and the only one that opts out of the template.
+
 ### 0b. Build an incremental, FC-capable inference driver (the real work)
 
 Neither existing entry point can serve a live eval:
@@ -214,32 +231,66 @@ Neither existing entry point can serve a live eval:
 | `offline_inference` (`:4911`) | no — whole `input_signal` up front | **yes**, but `function_responses` must be pre-baked from ground truth |
 | `online_inference` (`:5072`) | sliding window, but loops internally over all audio | **none** — no FC parameters, never references `function_responses` |
 
-The primitives are all present, so this is a refactor plus a live queue, not new modelling:
+The primitives are all present, so this is a refactor plus a live queue, not new modelling.
+Three findings from reading the code settle the design (2026-08-15):
 
-- `_init_inference` (`:3597`), `_step_zero` (`:3843`), `_step_inference` (`:3914`),
-  `_post_inference` (`:4302`) already carry an explicit `inference_state`.
-- `_prepare_function_responses_for_detection` (`:4042`) is already queue-based and the docstring
-  confirms **the model chooses the injection position**, not the ground truth. So a live queue
-  fed by the τ2 environment on `<TOOLCALL>` detection is a drop-in replacement for the pre-baked
-  tensors.
+**1. `online_inference` is already the incremental driver, structurally.** It is "online" only in
+the sense of *causal windowing*: `_init_inference` (`:3597`) runs `self.perception` over the whole
+signal and preallocates `[B, T, H]`, but the loop body then *overwrites*
+`inference_state["input_embeds"][:, t:t+1, :]` with a freshly encoded trailing window and calls
+`_step_inference` (`:5155-5170`). The preallocated content for frame `t` is never read once
+overwritten. So: preallocate a horizon of silence, extract the loop body into a
+`step(t, audio_so_far)` method, and drive it from the adapter instead of a `for` loop. The KV cache
+is already incremental. **This is a loop inversion, not a rewrite.**
 
-Deliverable: a driver that can be advanced one step at a time, accepts audio incrementally, and
-accepts a tool result at an arbitrary step.
+**2. The FC response queue is a genuine live seam.**
+`_prepare_function_responses_for_detection` (`:4042`) builds `response_queue[b] = [(turn_idx,
+tokens)]`, consumed when the model emits EOTC, and its docstring states the ground truth supplies
+*which* response, **not the position — "the model decides"**. So appending to that queue when a
+real τ2 tool result arrives is a drop-in for the pre-baked tensors. No ground truth needed.
 
-Note `online_inference` is also greedy-only — `temperature` / `top_p` / `repetition_penalty`
-exist on `offline_inference` only. Carry them over.
+**3. The actual blocker is timeline expansion, not the queue.**
+`_expand_for_function_calling` (`:4458`) precomputes the whole expansion from ground-truth
+`function_call_lengths` / `function_response_steps` / `function_response_lengths` before stepping,
+then sets `fc_expand_applied` (`:4864`). Live inference **cannot** supply that: the expansion
+depends on when the model chooses to call and how long the real tool result turns out to be.
+
+*Resolution — do not expand. Decouple two counters:*
+- `t_lm` — LM position; advances on every `_step_inference`, i.e. on audio frames **and** on
+  injected FC tokens.
+- `t_audio` — audio frames consumed; advances only as ticks deliver audio.
+
+FC injection then means stepping the LLM over the response tokens **without consuming audio**.
+Preallocate `max_audio_frames + max_fc_total_tokens` and skip `_expand_for_function_calling`
+entirely. This also sidesteps `_expand_waveform_fc_timeline` (`:4091`), which exists only to
+re-align the logged waveform after expansion.
+
+Sim time does not advance during injection, and that is **correct here**: the harness advances sim
+time by `audio_sent_duration_ms` (`adapter.py:262`), and τ2 tools are local in-memory Python with
+~0 latency. It does diverge from the teacher's ~6.5 s per tool call — deliberately, since that
+latency is the duplex model's architectural advantage and `response_latency_mean` is scored.
+Wall-clock cost lands inside the tick, which is harmless (see 0c).
+
+Deliverable: a driver advanced one step at a time, accepting audio incrementally and a tool result
+at an arbitrary step. Also carry over `temperature` / `top_p` / `repetition_penalty` /
+`presence_penalty` — `online_inference` is greedy-only; those exist on `offline_inference` only.
 
 ### 0c. Resolve the 200 ms ↔ 80 ms mismatch
 
-A 200 ms tick is 2.5 model frames. Options, in order of preference:
+A 200 ms tick is 2.5 model frames — non-integer. **Resolved: no cadence change is needed.** Keep a
+sample-level residual accumulator and consume `floor(available / frame_samples)` frames per tick.
+At 16 kHz an 80 ms frame is 1280 samples and a tick delivers 3200, so the pattern is exactly
+2, 3, 2, 3, … — mean 2.5, residual bounded at 640 samples (40 ms), never drifting. This is strictly
+better than the previously preferred 400 ms buffering: it keeps the 200 ms grid *and* full
+per-tick granularity.
 
-1. **Buffer to a 2-tick (400 ms = 5 frame) cadence.** Keeps the 200 ms grid so training data,
-   the Gemini baseline, and eval stay comparable. Costs 400 ms output granularity.
-2. Change `tick_duration_ms` to 160 ms (2 frames) or 240 ms (3 frames). Clean integration, but
-   breaks comparability with the existing data and baseline.
+The base class makes this safe. Sim time is `audio_sent_duration_ms`, not wall clock
+(`adapter.py:262`), and step 11 only ever *sleeps* to pad a fast tick (`:286-289`) — a GPU forward
+pass slower than 200 ms simply runs slower than realtime without corrupting the timeline. Local
+in-process inference is therefore compatible with this harness by construction.
 
-Recommend (1). Also confirm `online_window_size` (default 70 frames = 5.6 s) is adequate for
-turns that reference earlier context.
+Still to confirm: whether `online_window_size` (70 frames = 5.6 s) is adequate for turns
+referencing earlier context — it is the one parameter that could force a real design change.
 
 ### 0d. Produce the arm-A baseline
 
