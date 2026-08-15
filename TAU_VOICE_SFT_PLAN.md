@@ -476,7 +476,12 @@ the released 11B was trained with these unfrozen, so freezing changes the recipe
   `.venv/bin/tau2` works. `.venv` is gitignored.
 - `banking_knowledge` fails to export (`ModuleNotFoundError: rank_bm25`); the other 15 domains
   export cleanly. Install `rank_bm25` if that domain is ever needed.
-- /fsx has 23 G free (76 % used) — the "96 % full" note in older memory is stale.
+- **Disk is tightening, not easing.** `/fsx/home` is at **98 % — 2.2 T free of 74 T**, shared
+  across all users and still shrinking (3.5 T on 08-13, 3.2 T on 08-14, 2.2 T on 08-15). The
+  "23 G free / 76 %" figure noted earlier was `/` (the 97 G local root), a different mount —
+  do not use it to size a run. A `save_top_k: 3` run needs ~120 GB, which fits today, but an
+  `Errno 28` from others filling the last TB would land hours in at a checkpoint save. Check
+  `df -h /fsx/home` before launching and consider `save_top_k: 1`.
 - New tooling: `tau-voice-2/scripts/export_tool_schemas.py`,
   `nemo-voice-agent/scripts/measure_fc_token_budget.py`,
   `nemo-voice-agent/scripts/repair_tau2_fc_prompt.py`.
