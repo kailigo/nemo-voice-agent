@@ -28,6 +28,11 @@ ENV_PREFIX=/fsx/home/kai.li/miniforge3/envs/voicechat
 TAU2=/fsx/home/kai.li/code/tau-voice-2
 USER_LLM=bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0
 
+# Overridable rather than an extra arg: `--domain` is a plain argparse store, so passing a
+# second one would silently rely on last-wins. Stage 2 fans out over all three test
+# domains, so it needs to set this per worker.
+DOMAIN="${TAU2_DOMAIN:-retail}"
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 srun --jobid="$JOBID" --overlap bash -c "
@@ -47,7 +52,7 @@ srun --jobid="$JOBID" --overlap bash -c "
   export TAU2_NL_ASSERTIONS_MODEL='$USER_LLM'
   cd '$TAU2'
   exec '$ENV_PREFIX/bin/python' -u -m tau2.cli run \
-    --domain retail \
+    --domain '$DOMAIN' \
     --agent discrete_time_audio_native_agent \
     --audio-native \
     --audio-native-provider nemo \
