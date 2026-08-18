@@ -487,9 +487,40 @@ and tool-call parse rate. **Acceptance criterion for Phase 0: a baseline table e
 
 This also tells us which failures dominate, which should re-prioritise everything below.
 
-Budget it against the measured 23.5× realtime (0b-bis), not the old 4.4× figure: ~1.4 GPU-h per
-200 s conversation. Fan out one episode per GPU from the start, and resolve the ElevenLabs quota
-before committing an allocation to it.
+**Run it in three stages, not one pass.** The task lists are 278 tasks (retail 114, airline 50,
+telecom 114). Budget against the measured 23.5× realtime (0b-bis), not the old 4.4× figure.
+
+| stage | scope | GPU cost | wall (8 GPU) | TTS chars | what it buys |
+|---|---|---|---|---|---|
+| 1 | 1 task, full 200 s cap | 1.5 GPU-h | ~1.5 h (1 GPU) | ~1,900 | FC-budget headroom, no OOM, throughput at real prefix length |
+| 2 | 24 tasks (8/domain, spread) | 36 GPU-h | ~4.5 h | ~45k | the failure taxonomy, voice metrics, tool-call parse rate |
+| 3 | remaining 254 | 370 GPU-h | ~46 h | ~480k | the statistical baseline for the C-vs-A claim |
+
+Scripts: `scripts/tau2_stage1_full_episode.sh <jobid> <gpu>` and
+`scripts/tau2_select_subset.py` (emits the stage-2 `--task-ids`).
+
+**`--max-steps-seconds` is the single most expensive decision in Phase 0.** The pre-SFT checkpoint
+never terminates normally — both smoke runs ended on `max_steps` — so every episode costs *exactly*
+the cap, and cost is super-linear in it because the prefix grows through the episode: 200 s is
+1.5 GPU-h, the 1200 s default is 18.1, which puts arm A at 631 h on 8 GPUs instead of 51.
+
+Three further notes on running it:
+
+- **One episode per GPU is the ceiling.** 119,235 of 143,771 MiB at batch 1 (§1c) is ~85 % of a
+  140 GB card. Co-locating would not help much anyway: each step is a full ~5–7k-token *prefill*,
+  so it is compute-bound rather than bandwidth-bound.
+- **Hold the model across tasks.** Startup is ~4.5 min; at 35 tasks per worker, reloading per
+  episode throws away ~2.6 h of wall time.
+- **Do not build the subset with `--num-tasks`.** It is `tasks[:N]` and the lists are grouped by
+  scenario, so a prefix is badly biased — `--num-tasks 30` covers 20 of retail's 87 scenarios and
+  **1 of telecom's 3**. Telecom is the trap: only 3 distinct `reason_for_call` values across 114
+  tasks, because what varies there is the fault state and repair sequence, not what the user says.
+  `tau2_select_subset.py` keys on `evaluation_criteria` for telecom and on the scenario elsewhere.
+
+Stage 1 is the only stage that fits the ElevenLabs free tier, so resolve the quota (a paid plan
+sized for ~500k chars/month for one arm, ~1.5M for all three) before committing an allocation to
+stage 2 or 3. Also decide the trial count up front: 1 trial gives a noisy `pass^1`, and 4 trials
+multiplies every number in the table by four.
 
 ---
 
