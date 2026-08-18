@@ -488,39 +488,135 @@ and tool-call parse rate. **Acceptance criterion for Phase 0: a baseline table e
 This also tells us which failures dominate, which should re-prioritise everything below.
 
 **Run it in three stages, not one pass.** The task lists are 278 tasks (retail 114, airline 50,
-telecom 114). Budget against the measured 23.5× realtime (0b-bis), not the old 4.4× figure.
+telecom 114). The figures below are measured from a real full-length episode (stage 1, 2026-08-18),
+not extrapolated from short caps.
 
 | stage | scope | GPU cost | wall (8 GPU) | TTS chars | what it buys |
 |---|---|---|---|---|---|
-| 1 | 1 task, full 200 s cap | 1.5 GPU-h | ~1.5 h (1 GPU) | ~1,900 | FC-budget headroom, no OOM, throughput at real prefix length |
-| 2 | 24 tasks (8/domain, spread) | 36 GPU-h | ~4.5 h | ~45k | the failure taxonomy, voice metrics, tool-call parse rate |
-| 3 | remaining 254 | 370 GPU-h | ~46 h | ~480k | the statistical baseline for the C-vs-A claim |
+| 1 | 1 task, 200 s cap | **0.8 GPU-h (done)** | **49 min (done)** | ~400 | FC-budget headroom, memory ceiling, throughput at real prefix length |
+| 2 | 24 tasks (8/domain, spread) | 30–122 GPU-h | 4–15 h | ~45k | the failure taxonomy, voice metrics, tool-call parse rate |
+| 3 | remaining 254 | 320–1,300 GPU-h | 40–162 h | ~480k | the statistical baseline for the C-vs-A claim |
 
+The ranges are not uncertainty about throughput — they are `--hallucination-retries` (see below).
 Scripts: `scripts/tau2_stage1_full_episode.sh <jobid> <gpu>` and
 `scripts/tau2_select_subset.py` (emits the stage-2 `--task-ids`).
 
-**`--max-steps-seconds` is the single most expensive decision in Phase 0.** The pre-SFT checkpoint
-never terminates normally — both smoke runs ended on `max_steps` — so every episode costs *exactly*
-the cap, and cost is super-linear in it because the prefix grows through the episode: 200 s is
-1.5 GPU-h, the 1200 s default is 18.1, which puts arm A at 631 h on 8 GPUs instead of 51.
+**`--hallucination-retries` is the single most expensive decision in Phase 0, and it defaults to 3.**
+`batch.py::run_unit` re-runs the *entire episode* whenever the post-hoc reviewer finds fabricated
+user content, up to 3 times, keeping the last attempt (`hallucination_retries_used`). So a task
+costs up to **4 episodes**, and that multiplier — not the tick budget — is what decides whether
+stage 3 fits in an allocation: 40 h at 1 attempt, 162 h (6.7 days) at 4. Stage 1's first attempt
+was flagged and re-run, so for arm A assume the multiplier bites: with an inaudible agent
+(`SilenceTTS`) the user simulator has nothing to react to and invents context, which is exactly
+what the reviewer is built to catch. Each retry does inject reviewer feedback and a new seed
+(`seed + n·1000`), so retries are not pure repetition — but budget for 4 and set the flag
+deliberately.
 
-Three further notes on running it:
+**`--max-steps-seconds` is *not* the binding cost, which corrects an earlier reading of this plan.**
+The pre-SFT checkpoint does not run to the cap: it terminates on `TOO_MANY_ERRORS` first.
+`orchestrator.py:327` counts *environment-rejected tool calls*, `max_errors` is 10, and the
+measured episode hit 10 and stopped at **tick 691 of 1000** (138 s of a 200 s cap) after 4,557 s of
+wall clock. So a pre-SFT episode is ~1.3 GPU-h and the cap is an upper bound rather than the price.
+Expect this to invert once a fine-tuned checkpoint stops making bad calls — arm C episodes will run
+longer per attempt and should be re-timed, not assumed.
 
-- **One episode per GPU is the ceiling.** 119,235 of 143,771 MiB at batch 1 (§1c) is ~85 % of a
-  140 GB card. Co-locating would not help much anyway: each step is a full ~5–7k-token *prefill*,
-  so it is compute-bound rather than bandwidth-bound.
+**Throughput over a full episode is 6.6 s/tick, not 4.72.** 4,557 s / 691 ticks. The 4.72 in 0b-bis
+was measured over the first 199 ticks; the difference is the linear-in-prefix growth that section
+documents, so both are right and the long-run figure is the one to budget with (33× realtime).
+
+**Memory: ~79 GB mid-episode, not the 119 GB in §1c.** That 119,235 MiB is a *training* figure and
+overstates inference by ~40 GB. Measured on a 143,771 MiB H200: 79,481 MiB at tick 566 with the GPU
+pinned at 100 % util (confirming the compute-bound prefill), rising to a stable ~115 GB after a
+second in-process model load on the hallucination retry — so loads do not fully release, and 3+
+loads in one process is where OOM risk actually lives. One episode per GPU remains the ceiling
+(2 × 79 GB > 143 GB), but there is more headroom than §1c implied.
+
+Two further notes on running it:
+
 - **Hold the model across tasks.** Startup is ~4.5 min; at 35 tasks per worker, reloading per
-  episode throws away ~2.6 h of wall time.
+  episode throws away ~2.6 h of wall time. Note the retry path already reloads in-process, which
+  is where the memory growth above comes from.
 - **Do not build the subset with `--num-tasks`.** It is `tasks[:N]` and the lists are grouped by
   scenario, so a prefix is badly biased — `--num-tasks 30` covers 20 of retail's 87 scenarios and
   **1 of telecom's 3**. Telecom is the trap: only 3 distinct `reason_for_call` values across 114
   tasks, because what varies there is the fault state and repair sequence, not what the user says.
   `tau2_select_subset.py` keys on `evaluation_criteria` for telecom and on the scenario elsewhere.
 
-Stage 1 is the only stage that fits the ElevenLabs free tier, so resolve the quota (a paid plan
-sized for ~500k chars/month for one arm, ~1.5M for all three) before committing an allocation to
-stage 2 or 3. Also decide the trial count up front: 1 trial gives a noisy `pass^1`, and 4 trials
-multiplies every number in the table by four.
+**Stage 1 is DONE (2026-08-18) — see 0d-bis for what it measured and the one bug it found.**
+
+**The ElevenLabs quota is not the stage-1 blocker it looked like.** A full episode against
+`SilenceTTS` spends only a few hundred characters, because a user simulator with nothing to listen
+to says almost nothing (measured: ~425 chars across two partial episodes, 7,460 of 10,000 left).
+Stage 2 is where the quota binds, and it binds harder there than the table suggests, because stage 2
+needs a *real* voice — `NeMoTTS` locally, or the official voice for leaderboard comparability — and
+an audible agent produces a conversation that actually progresses. Also decide the trial count up
+front: 1 trial gives a noisy `pass^1`, and 4 trials multiplies every number in the table by four.
+
+### 0d-bis. Stage 1 result (2026-08-18): PASS, and the failure mode is now known
+
+`scripts/tau2_stage1_full_episode.sh 1278 0 --hallucination-retries 0` → *Successfully completed
+all simulations*, `EXIT=0`, result persisted to `data/simulations/stage1_full_episode/`.
+340 ticks, 2,939.8 s, `termination_reason=too_many_errors`, reward 0.0, `pass^1 = 0.000`.
+Reward 0.0 is the expected and correct answer for `stt_extracted_lora`; the point of stage 1 was
+everything else.
+
+**The arm-A failure mode, exactly.** The agent made **10 tool calls and all 10 failed**:
+
+| calls | tool | error |
+|---|---|---|
+| 7 | `find_user_id_by_name` | `Tool not found` — **the tool does not exist** |
+| 1 | `find_user_id_by_zip` | `Tool not found` — **the tool does not exist** |
+| 2 | `find_user_id_by_name_zip` | `User not found` — real tool, wrong arguments |
+
+So the checkpoint **invents tool names**, and its inventions are plausible truncations of the real
+one (`find_user_id_by_name_zip` → `find_user_id_by_name`). 8 of 10 calls were unroutable. This is a
+better-specified target for SFT than "scores 0": the *wire format* is already right — all 10 parsed
+cleanly, confirming the `_TOOLCALL_BLOCK` fix in 0b-ter — and what is missing is the tool inventory
+and argument binding. It is also *why* episodes end early: `max_errors` is 10 (§0d).
+
+**Cost is 2/3 GPU and 1/3 API, which changes how to parallelise.** Decomposing the 2,642 s of tick
+time by whether the tick invoked the user simulator:
+
+- 198 ticks with no user generation: **4.86 s** mean — this is the GPU cost, and it grows only
+  4.27 → 5.90 s (+38 %) from the first quarter to the last, consistent with the linear-in-prefix
+  model in 0b-bis.
+- 142 ticks (42 %) that did generate: **11.83 s** mean. Only 1.81 s of that is the user-simulator
+  LLM (257 s total, 10 % of wall clock); the rest is the turn-taking decision/interrupt models and
+  TTS.
+
+*Do not read the raw 7.77 s/tick mean as prefix growth.* Per-tick wall clock rises 4.41 → 12.91 s
+across the episode, but that is composition, not slowdown: generate-ticks cluster late, because as
+the agent becomes unresponsive the simulator is asked to speak more often. The GPU curve underneath
+is the gentle one. **~36 % of arm-A wall clock is API latency that holds no GPU**, so 8 concurrent
+episodes per node is if anything conservative.
+
+**Memory, FC budget, and horizon: all clear.** 74–79 GB of 143,771 MiB at steady state (the §1c
+figure of 119,235 MiB is a *training* number and overstates inference by ~40 GB), GPU pinned at
+100 % util, `fc budget=12000` never approached, and `T=20325 / audio horizon=3750 frames` never
+exhausted. The one memory hazard is the retry path — see 0d.
+
+**Episode length is highly variable, so budget on the mean and not on one sample.** Two full
+episodes of the same task ended at 340 and 691 ticks (0.8 and 1.3 GPU-h). Length is set by how fast
+the agent burns 10 tool errors, which is sampling-dependent. At 0.8–1.3 GPU-h, 278 tasks is
+**222–361 GPU-h, or 28–45 h on 8 GPUs** with retries off — better than the 51 h projected from the
+cap, because these episodes self-terminate.
+
+**One harness bug found and fixed** (tau-voice-2 `82187c5`): an empty user-simulator completion was
+fatal. `_generate_full_duplex_voice_message` passed it to `synthesize_voice`, which raises
+`ValueError("Message must have text content.")`, and nothing in the simulation loop catches it — so
+the episode died and `run_with_retry` then spent all 3 retries reproducing it, reloading an 11B
+model each time. It first fired at tick 144 of a 1,000-tick run. Silence is a legal duplex state and
+the context that provokes it is literally a `[Both parties silent for N seconds]` annotation, so it
+is now treated as "stay quiet this tick", the same as the `wait` action. **The completed stage-1
+episode hit that path 139 times in 340 ticks** — this was not a rare edge case; it was
+unconditionally blocking, and it is blocking for any inaudible agent, which every arm is until the
+TTS question below is settled.
+
+**What stage 1 deliberately does not answer.** Reward, and anything downstream of the agent being
+audible: it ran with `SilenceTTS`, so the user simulator has nothing to react to and the
+conversation collapses into mutual silence (hence 139 silence ticks). Stage 2 must switch to a real
+voice — `NeMoTTS` locally, or the official voice for leaderboard comparability — before any reward
+or voice-metric number from it means anything.
 
 ---
 
