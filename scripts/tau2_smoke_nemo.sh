@@ -38,6 +38,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 srun --jobid="$JOBID" --overlap bash -c "
   export LD_LIBRARY_PATH='$ENV_PREFIX/lib:\${LD_LIBRARY_PATH:-}'
   export CUDA_VISIBLE_DEVICES='$GPU'
+  # provider.py:276 does os.environ.setdefault('MASTER_PORT', '29593') for the single-rank
+  # process group DuplexSTTModel needs. It is a fixed port, so N concurrent episodes on one
+  # node all race for it and N-1 die with 'EADDRINUSE ... port: 29593' -- which surfaces as
+  # 4 failed attempts in 3 seconds and reads like a networking fault. Deriving the port
+  # from the GPU index is collision-free by construction, because this script places
+  # exactly one process per GPU. setdefault means this export wins.
+  export MASTER_PORT=\$((29593 + $GPU))
   # The official tau-bench voice ids 404 on our ElevenLabs key; see the file's header.
   source '$HERE/tau2_stock_voices.env'
   # The user simulator's interruption/backchannel decisions use their own hardcoded

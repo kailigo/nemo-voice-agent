@@ -189,3 +189,6 @@ data/
 data/*
 !data/tau2_training_samples/
 !data/tau2_training_samples/**
+
+# Run logs from scripts/tau2_stage2_subset.sh and friends (per-episode tau2 output).
+logs/

@@ -39,6 +39,17 @@
 # the free tier. A run that dies on quota fails LOUDLY (tts_retry reraises), and every
 # completed episode is already on disk in its own directory, so nothing is lost.
 #
+# LAUNCH IT DETACHED. It holds 8 `srun --overlap` steps for hours, so it must not be tied to
+# an interactive shell or an agent tool call:
+#
+#   setsid nohup scripts/tau2_stage2_subset.sh <jobid> >logs/stage2_launch.log 2>&1 </dev/null &
+#
+# And note the failure mode that is NOT this script's fault: every step dies with SIGTERM
+# ("STEP <job>.<n> CANCELLED ... DUE to SIGNAL Terminated", rc=143) the moment the
+# allocation ends, whoever ends it. Check `sacct -j <jobid>` before debugging the run --
+# the first full-scale attempt was killed 3 minutes in by `CANCELLED by 0`,
+# `Reason=AssocGrpNodeLimit`, which has nothing to do with the episodes.
+#
 # Usage: scripts/tau2_stage2_subset.sh <jobid> [extra tau2 run args...]
 
 set -euo pipefail
@@ -55,6 +66,10 @@ NGPU="${NGPU:-8}"
 LOGDIR="${LOGDIR:-$HERE/../logs/$RUN}"
 
 mkdir -p "$LOGDIR"
+# Truncate rather than append: a stale progress.log from an aborted attempt makes the final
+# tally read as successes that never happened (the first launch's 7 OKs survived into the
+# second and were counted there).
+: >"$LOGDIR/progress.log"
 
 # --- build the job list -----------------------------------------------------
 # TSV rather than a shell array of ids: telecom ids contain `|` and `[]`
@@ -102,18 +117,28 @@ for ((slot = 0; slot < NGPU; slot++)); do
       log="$LOGDIR/gpu${slot}__${domain}__${slug}.log"
 
       echo "[gpu $slot] START $domain $task_id" >>"$LOGDIR/progress.log"
-      if TAU2_DOMAIN="$domain" "$HERE/tau2_smoke_nemo.sh" "$JOBID" "$slot" \
+      rc=0
+      TAU2_DOMAIN="$domain" "$HERE/tau2_smoke_nemo.sh" "$JOBID" "$slot" \
         --task-ids "$task_id" \
         --max-steps-seconds "$CAP_SECONDS" \
         --hallucination-retries 0 \
         --save-to "$name" \
         --log-level INFO \
-        "$@" >"$log" 2>&1; then
-        echo "[gpu $slot] OK   $domain $task_id" >>"$LOGDIR/progress.log"
+        "$@" >"$log" 2>&1 || rc=$?
+
+      # Exit 0 is NOT enough. An episode that dies in setup is recorded as an
+      # INFRASTRUCTURE_ERROR simulation, excluded from the metrics panel, and the batch then
+      # reports "Successfully completed all simulations" and exits 0. The first stage-2
+      # launch had 7 of 8 workers fail on a port collision and every one logged OK. So look
+      # for the retry exhaustion line too; it is the thing that is actually diagnostic.
+      # Deliberately does not abort the slot: the remaining episodes are independent, and a
+      # partial stage 2 still answers the diagnostic question.
+      if ((rc != 0)); then
+        echo "[gpu $slot] FAIL $domain $task_id rc=$rc (see $log)" >>"$LOGDIR/progress.log"
+      elif grep -q "failed permanently after" "$log"; then
+        echo "[gpu $slot] INFRA $domain $task_id (see $log)" >>"$LOGDIR/progress.log"
       else
-        # Deliberately does not abort the slot: the remaining episodes are independent, and
-        # a partial stage 2 still answers the diagnostic question. Failures are in the log.
-        echo "[gpu $slot] FAIL $domain $task_id (see $log)" >>"$LOGDIR/progress.log"
+        echo "[gpu $slot] OK $domain $task_id" >>"$LOGDIR/progress.log"
       fi
     done <"$JOBS"
   ) &
@@ -127,6 +152,7 @@ done
 
 N_OK=$(grep -c ' OK ' "$LOGDIR/progress.log" || true)
 N_FAIL=$(grep -c ' FAIL ' "$LOGDIR/progress.log" || true)
-echo "stage 2 fan-out finished: ${N_OK:-0} ok, ${N_FAIL:-0} failed, of $N_JOBS"
+N_INFRA=$(grep -c ' INFRA ' "$LOGDIR/progress.log" || true)
+echo "stage 2 fan-out finished: ${N_OK:-0} ok, ${N_INFRA:-0} infra, ${N_FAIL:-0} failed, of $N_JOBS"
 echo "Merge with: scripts/tau2_merge_results.py --run $RUN"
 exit "$FAILED"
