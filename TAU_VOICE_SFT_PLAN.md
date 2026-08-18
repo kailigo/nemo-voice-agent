@@ -474,7 +474,8 @@ Four integration bugs it caught, none of which raise in the standalone checks:
    files plus `simulation_index`, so an empty list is not evidence a run was lost.
 
 Two external blockers remain, neither of them code. The **ElevenLabs key is free-tier** (10,000
-chars/month, ~7.9k left) — enough for smoke tests, nowhere near a 300-conversation baseline. And
+chars/month, 6,228 left as of 2026-08-18, no extension possible, resets 2026-09-11) — enough for
+smoke tests, nowhere near a 300-conversation baseline. And
 **all seven official τ-bench voice ids 404** on our key (they are private voices in Sierra's
 account); `scripts/tau2_stock_voices.env` substitutes stock library voices, which costs external
 leaderboard comparability and makes `regular`-complexity results meaningless, so pass
@@ -506,9 +507,10 @@ Scripts: `scripts/tau2_stage1_full_episode.sh <jobid> <gpu>` and
 user content, up to 3 times, keeping the last attempt (`hallucination_retries_used`). So a task
 costs up to **4 episodes**, and that multiplier — not the tick budget — is what decides whether
 stage 3 fits in an allocation: 40 h at 1 attempt, 162 h (6.7 days) at 4. Stage 1's first attempt
-was flagged and re-run, so for arm A assume the multiplier bites: with an inaudible agent
-(`SilenceTTS`) the user simulator has nothing to react to and invents context, which is exactly
-what the reviewer is built to catch. Each retry does inject reviewer feedback and a new seed
+was flagged and re-run, so for arm A assume the multiplier bites: a pre-SFT agent that says almost
+nothing (211 characters of text across 340 ticks) leaves the user simulator nothing to react to, so
+it invents context — which is exactly what the reviewer is built to catch. Each retry does inject
+reviewer feedback and a new seed
 (`seed + n·1000`), so retries are not pure repetition — but budget for 4 and set the flag
 deliberately.
 
@@ -544,12 +546,14 @@ Two further notes on running it:
 
 **Stage 1 is DONE (2026-08-18) — see 0d-bis for what it measured and the one bug it found.**
 
-**The ElevenLabs quota is not the stage-1 blocker it looked like.** A full episode against
-`SilenceTTS` spends only a few hundred characters, because a user simulator with nothing to listen
-to says almost nothing (measured: ~425 chars across two partial episodes, 7,460 of 10,000 left).
-Stage 2 is where the quota binds, and it binds harder there than the table suggests, because stage 2
-needs a *real* voice — `NeMoTTS` locally, or the official voice for leaderboard comparability — and
-an audible agent produces a conversation that actually progresses. Also decide the trial count up
+**The ElevenLabs quota is not the stage-1 blocker it looked like.** The completed 340-tick episode
+spent **172 characters** — three user utterances — because a user simulator with nothing to react to
+says almost nothing. Quota after stage 1: **3,772 of 10,000 used, resets 2026-09-11 07:03 UTC,
+`can_extend_character_limit: False`.** The quota is a *user-simulator* cost and is unrelated to the
+agent's voice (see 0d-bis). It binds at stage 3 rather than stage 2: a conversation that actually
+progresses is 10–20 user turns ≈ 1–2k chars, so 254 episodes is ~50k–500k chars, 5–50× the monthly
+allowance. In dollars that is ~$5–50 at ElevenLabs' $50–100/M, so **the constraint is the free tier,
+not the money** — a month of a paid plan covers all of Phase 0. Also decide the trial count up
 front: 1 trial gives a noisy `pass^1`, and 4 trials multiplies every number in the table by four.
 
 ### 0d-bis. Stage 1 result (2026-08-18): PASS, and the failure mode is now known
@@ -609,14 +613,31 @@ model each time. It first fired at tick 144 of a 1,000-tick run. Silence is a le
 the context that provokes it is literally a `[Both parties silent for N seconds]` annotation, so it
 is now treated as "stay quiet this tick", the same as the `wait` action. **The completed stage-1
 episode hit that path 139 times in 340 ticks** — this was not a rare edge case; it was
-unconditionally blocking, and it is blocking for any inaudible agent, which every arm is until the
-TTS question below is settled.
+unconditionally blocking, and it is blocking for any near-mute agent, which every arm is until the
+model learns to talk on task.
 
-**What stage 1 deliberately does not answer.** Reward, and anything downstream of the agent being
-audible: it ran with `SilenceTTS`, so the user simulator has nothing to react to and the
-conversation collapses into mutual silence (hence 139 silence ticks). Stage 2 must switch to a real
-voice — `NeMoTTS` locally, or the official voice for leaderboard comparability — before any reward
-or voice-metric number from it means anything.
+**`SilenceTTS` does not invalidate reward — nothing listens to the agent's audio.** This corrects an
+earlier claim in this plan that stage 2 needed a real voice before its numbers meant anything. The
+agent→user channel is *text*, not audio: every persisted `agent_chunk` has `is_audio: false` and a
+text `content`, and `discrete_time_adapter._execute_tick` uses the synthesised PCM for exactly two
+purposes — `_record_audio` → `get_proportional_transcript`, which paces the text across ticks in
+proportion to audio played, and the `both.wav` artifact. There is no ASR anywhere on the agent side;
+the agent transcript comes straight off the LM's text channel. So the agent's voice *quality* enters
+no metric and only its *duration* matters, which `SilenceTTS` already models at 150 wpm.
+
+What `SilenceTTS` therefore actually costs is narrow: the agent channel of `both.wav` is silent (so
+nothing is human-listenable), and pacing is flat-rate rather than real prosody, which perturbs
+turn-taking and interruption *timing* only. If a real agent voice is wanted for either reason,
+**`NeMoTTS` is the right choice — local, free, no quota** — and an ElevenLabs agent voice would buy
+nothing measurable. (It would be ~15 lines if ever needed: `TextToSpeech` wants PCM16 at
+`NEMO_SAMPLE_RATE` = 16 kHz, and `voice/synthesis/synthesize.py::synthesize_voice` already returns
+exactly that, retries included. Note `--nemo-tts` is named in `nemo/config.py`'s docstring but **no
+such CLI flag exists**; set `cfg.tts` or add a preset.)
+
+**What stage 1 deliberately does not answer.** Reward against a *competent* agent. The conversation
+collapsed into mutual silence (hence the 139 silence ticks) because the pre-SFT checkpoint emitted
+211 characters of text in 340 ticks and then errored out — an agent-quality result, not a TTS
+artifact. Stage 2 can proceed on `SilenceTTS`; its reward number is as meaningful as stage 3's.
 
 ---
 
