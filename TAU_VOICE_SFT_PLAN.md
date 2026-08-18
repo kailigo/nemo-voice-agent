@@ -240,8 +240,11 @@ signal and preallocates `[B, T, H]`, but the loop body then *overwrites*
 `inference_state["input_embeds"][:, t:t+1, :]` with a freshly encoded trailing window and calls
 `_step_inference` (`:5155-5170`). The preallocated content for frame `t` is never read once
 overwritten. So: preallocate a horizon of silence, extract the loop body into a
-`step(t, audio_so_far)` method, and drive it from the adapter instead of a `for` loop. The KV cache
-is already incremental. **This is a loop inversion, not a rewrite.**
+`step(t, audio_so_far)` method, and drive it from the adapter instead of a `for` loop.
+**This is a loop inversion, not a rewrite.**
+
+*Correction (2026-08-17, on GPU):* the last sentence of that paragraph originally read "the KV
+cache is already incremental." **It is not, and it cannot be made so from here** — see 0b-bis.
 
 **2. The FC response queue is a genuine live seam.**
 `_prepare_function_responses_for_detection` (`:4042`) builds `response_queue[b] = [(turn_idx,
@@ -275,6 +278,152 @@ Deliverable: a driver advanced one step at a time, accepting audio incrementally
 at an arbitrary step. Also carry over `temperature` / `top_p` / `repetition_penalty` /
 `presence_penalty` — `online_inference` is greedy-only; those exist on `offline_inference` only.
 
+### 0b-bis. There is no KV cache, and the prompt must not be stepped
+
+Two findings from building and running the driver (`streaming_fc_session.py`, validated on an H200
+via `scripts/run_on_gpu.sh` and `scripts/check_streaming_driver.py --checks cache,stream`).
+
+**No incremental decode exists for this checkpoint.** `_init_inference` (`:3719`) sets
+`use_cache=False` for Nemotron and that is *correct*, not a stub. Three independent blockers, in
+increasing order of severity:
+
+1. `DynamicCache` is the wrong type. Nemotron-Nano-9B-v2 is a **hybrid Mamba2/attention** model
+   (`modeling_nemotron_h.py`), so half the layers need conv/SSM state, not K/V. Forcing it on dies
+   with `AttributeError: 'DynamicCache' object has no attribute 'conv_kernel_size'`.
+2. The model's own `HybridMambaAttentionDynamicCache` (`:155`) does not work either: it never
+   assigns `self.conv_kernel_size` (only the mixer does, `:294`) though `:461`/`:546` read it off
+   the cache, and `update_conv_state(cache_init=True)` dereferences `.device` on a *list*.
+3. **The decisive one:** incremental decode is unreachable through this call path. The Mamba
+   mixer's single-step branch is gated on `cache_position[0] > 0` (`:375`), `NemotronHModel.forward`
+   defaults `cache_position` to `arange(seq_len)` (`:1359`), and `DuplexSTTModel.forward` (`:466`)
+   **has no `cache_position` parameter at all**. A one-position step therefore always arrives as
+   `cache_position=[0]` and every layer takes the *prefill* branch. This would not raise; it would
+   be **silently wrong** — the worst available failure mode.
+
+Consequence: every step re-runs the full prefix, so inference is **O(T²)**. Check 1 in
+`check_streaming_driver.py` exists to keep this reproducible — it PASSES when forcing the cache
+*fails*, so the conclusion cannot quietly rot into folklore. The fix, if throughput demands it, is
+to thread `cache_position` as an additive optional kwarg plus a repaired cache subclass; that is a
+real change to the model's forward signature and is deliberately out of Phase 0 scope.
+
+**Measured cost, in the real harness (`tau2 run`, retail, one H200, 2026-08-18): 199 ticks in
+939.8 s for 40.0 s of audio = 4.72 s/tick against a 200 ms budget, i.e. 23.5× slower than
+realtime.** Per 0c this is *not* a correctness problem — the harness derives sim time from
+`audio_sent_duration_ms` and only ever sleeps to pad a *fast* tick, so a slow forward just runs
+slow. It is purely an eval-throughput cost, and it is a large one: **~1.4 GPU-hours per 200 s
+conversation, so a 300-conversation baseline is ~430 GPU-hours, ~54 h across 8 GPUs.** That is
+affordable once for arm A only if it is planned for; it is far too slow to iterate against.
+
+Three things the per-tick series says, and they settle where the cost goes:
+
+*The cost is 100 % LM frames.* Tick times alternate exactly 3.46 s / 5.20 s, tracking the
+2,3,2,3 residual-accumulator pattern. Fitting `t = a + b·frames` gives **b = 1.74 s/frame, a =
+−0.02 s**: the fixed per-tick overhead — TTS, resampling, the tick machinery, the user simulator —
+is *zero* to measurement precision. Every optimisation has to come out of the forward pass.
+
+*Per-frame cost is linear in prefix length, and the prompt is the prefix.* Same driver, same GPU,
+same window, with a 37-token prompt instead of the τ2 tool schema: **77 ms/frame** (120 ticks in
+23.1 s = 0.96× realtime). Prefix ratio 25×, time ratio 22.5× — linear, as a full prefix re-run
+must be. This is why the earlier standalone figure recorded here (879 ms/tick, "4.40× realtime")
+was misleading and has been replaced: it was not measured with the τ2 tool-schema prompt loaded, so
+it described a prefix an order of magnitude shorter than any real episode.
+
+*Growth within an episode is the small term.* Ticks 2–50 mean 4.49 s, ticks 151–200 mean 4.85 s —
+only **+8 %** across 500 frames. The O(T²) audio term barely registers because 4,575 prompt tokens
+dwarf 2,500 frames even at the end of a 200 s conversation. Which is the point: the blowup is the
+model re-reading the tool schemas on every single frame, and those bytes are identical on every
+step and across every conversation in a domain. **A prompt-prefix cache alone is worth ~20×** —
+enough on its own to bring this to roughly realtime — and it is by a wide margin the highest-value
+optimisation available, well before full incremental decode. The Mamba layers are what make it
+non-trivial: reusing prompt state requires passing an initial recurrent state into the suffix
+kernel, which is the same missing plumbing as above.
+
+**Do not step the LLM over the prompt.** The naive driver replayed `_step_inference` once per
+prompt position — ~4.3k discarded full-prefix forwards before the first audio frame. In the
+no-cache regime every step is stateless, so the whole loop is replaceable by one vectorized write
+(`_prefill_prompt_embeds`): with no cache the only surviving effect of a prompt-position step is
+the fusion write at `:3969`; all `gen_*` writes sit behind `if not is_prompt_position.all()`
+(`:4014`), fusion is elementwise over positions, and RNNT is gated on `_run_rnnt_in_loop`, which is
+never set. Measured: `start()` went from minutes to **0.0 s**. This equivalence is valid *only*
+because there is no cache — restoring one invalidates it, and the docstring says so.
+
+### 0b-ter. Validation status of the driver, and the bug it caught
+
+Driver: `nemo/collections/speechlm2/models/streaming_fc_session.py`. Checks:
+`scripts/check_streaming_driver.py` (GPU, via `scripts/run_on_gpu.sh <jobid> <gpu> …`) and
+`scripts/test_parse_call.py` (CPU, no model — runs in a second).
+
+| Seam | Status |
+|---|---|
+| Cache cannot be forced on | **PASS**, reproduced in 1 s (check 1) |
+| Two-clock arithmetic `t_lm = prompt + audio + fc` | **exact** at 150 / 750 / 2,495 frames |
+| Residual accumulator (200 ms → 2,3,2,3 frames) | **exact**, `residual_samples: 0` every run |
+| Full 199.6 s conversation | **PASS** — 2,495 frames, no drift, no horizon exhaustion |
+| Throughput | 4.72 s/tick = **23.5× realtime** in-harness (see 0b-bis) |
+| FC detect → parse → inject | **PASS** via forced call (check 4) |
+| Model *spontaneously* emitting `<SOTC>` | **untestable pre-SFT** (check 3, INCONCLUSIVE by design) |
+| Injected tool result is *read* by the model | **PASS**, unexpectedly (see below) |
+| Live τ2 orchestrator (`tau2 run`, retail) | **PASS**, `EXIT=0` — see 0c-bis |
+| Causal-window vs offline agreement | **not answerable pre-SFT** (see below) |
+
+**Check 4 exists because check 3 cannot pass yet.** Check 3 waits for the checkpoint to emit
+`<SOTC>`; `stt_extracted_lora` is the *input* to our SFT and has never seen τ2 data, so it never
+will — which would have left the entire FC round-trip unvalidated until after training. Check 4
+instead forces a known `<SOTC> <TOOLCALL>[…]</TOOLCALL> <EOTC>` sequence onto the function channel
+(one token per audio frame, matching the training layout) and drives the real detection state
+machine, parser, mid-tick stall, wire formatting, and injection.
+
+It immediately earned itself. `_TOOLCALL_BLOCK` was `<TOOLCALL>\s*(\[.*\])\s*$` — **anchored to
+end-of-string, while the trained format ends with `</TOOLCALL>`**. The regex never matched, the
+blob kept its tags, `json.loads` failed, and *every* tool call decoded to `name=""` with empty
+arguments. Nothing raises on that path: the provider would have forwarded empty-named calls into
+τ2, so arm C would have scored ~0 tool success and read as "the model picks tools badly" rather
+than as a one-line parser bug. Fixed, plus a tolerant fallback (missing either tag, bare object,
+nested arrays in arguments), 12 CPU cases in `scripts/test_parse_call.py`, and a distinct
+`UNPARSEABLE` warning in the provider so this class of failure can never again masquerade as poor
+model behaviour.
+
+Lesson worth keeping: **a check whose pass condition depends on model quality validates nothing
+until the model is good.** Force the input instead.
+
+**The injected result is genuinely read, not merely stepped over.** Check 4 forces exactly one
+call, then leaves the function channel entirely model-driven. At tick 31 the forced
+`find_user_id_by_name_zip` was detected and `{"user_id": "yusuf_rossi_9620"}` injected; at tick 85
+the *model* emitted its own well-formed `<SOTC> <TOOLCALL>[…]</TOOLCALL> <EOTC>` block —
+`get_order_details({"order_id": "yusuf_rossi_9620"})`, carrying the exact value from the injected
+response. Two things follow. (1) `_drain_injection` really does place response tokens where the LM
+attends to them; the FC round-trip is validated semantically, not just mechanically. (2) The
+earlier claim that a pre-SFT checkpoint "never emits `<SOTC>`" needs qualifying: it never does so
+*unprompted*, but one in-context exemplar is enough for it to imitate the wire format correctly.
+Semantically the follow-up is wrong (a `user_id` passed as `order_id`) — which is precisely the
+tool-use competence SFT is meant to supply, and a useful sign that the format is the easy part.
+This also means check 4 must assert on the *first* call only; requiring exactly one call made it
+fail for succeeding too well.
+
+**The `online_window_size` question cannot be answered on this checkpoint.** `--compare-offline`
+reports 875 ms/tick and a similarity of 0.0273 raw, but that number is an artifact, not a
+measurement (see below).
+
+**Throughput is a cost, not a blocker — but it is a bigger cost than first recorded.** At the
+measured 23.5× realtime (0b-bis), ~430 GPU-hours across the 8 GPUs of one node is **~54 h wall**.
+`ml.p5en.48xlarge` grants **4 days** per job (the partition allows 7; only the unused `interactive`
+partition is capped at 4 h), so a full 300-conversation baseline still fits inside a single ordinary
+allocation — but it now consumes over half of one, rather than an overnight slice. Two consequences
+worth acting on: run arm A **8-way in parallel from the start** (one episode per GPU, each loads its
+own 9B — `--max-concurrency 1` per process, 8 processes), and treat the prompt-prefix cache as
+promoted from "nice to have" to the thing that decides whether arms B and C are affordable at the
+same scale. The *debug* loop is ~80 min per 200 s conversation, so debug against short
+`--max-steps-seconds`, never a full episode. The scarce resource remains obtaining an allocation at
+all (25 of 27 p5en nodes were `alloc` on 2026-08-18), so when one is held, use it.
+
+Restating the artifact point precisely: the similarity number is not a
+measurement: `offline_inference` emits audio-timestamp tokens (`<$0.72$>`, `<|1.52|>`) that the
+driver strips, and `difflib`'s ratio is then dominated by the length mismatch (the check now also
+reports a normalized figure). More fundamentally, both outputs are off-task refusal boilerplate, so
+comparing them measures nothing about whether a 5.6 s causal window suffices for *turns referencing
+earlier context* — the actual question in 0c. Answering it needs a τ2-tuned checkpoint; deferred
+rather than guessed at, and 0c's "still to confirm" stands.
+
 ### 0c. Resolve the 200 ms ↔ 80 ms mismatch
 
 A 200 ms tick is 2.5 model frames — non-integer. **Resolved: no cadence change is needed.** Keep a
@@ -292,12 +441,55 @@ in-process inference is therefore compatible with this harness by construction.
 Still to confirm: whether `online_window_size` (70 frames = 5.6 s) is adequate for turns
 referencing earlier context — it is the one parameter that could force a real design change.
 
+### 0c-bis. The integration is validated end to end (2026-08-18)
+
+`DiscreteTimeNeMoAdapter` had never run inside a live τ2 orchestrator; standalone checks cannot
+cover that seam. `scripts/tau2_smoke_nemo.sh` now does, and a retail episode completes with
+`EXIT=0`: 101 ticks, `NeMo duplex session ready: prompt=4575 tokens, 16 tools, modality=audio`,
+non-empty agent transcript, `termination_reason=max_steps`, reward persisted, and the post-episode
+hallucination reviewer run against Bedrock. **Reward 0.0 is the correct result here** —
+`stt_extracted_lora` emits off-task refusal boilerplate and makes no tool calls — so it measures the
+harness, not the model.
+
+Four integration bugs it caught, none of which raise in the standalone checks:
+
+1. **`import pyaudio` at module scope** in `voice/utils/audio_io.py` made the whole voice package
+   unimportable on a headless node, and `registry.py` catches that ImportError and logs it at
+   DEBUG — so `voice_streaming_user_simulator` was *silently absent from the registry*. Made lazy
+   inside `play_audio`, its only caller.
+2. **`UtteranceTranscript` has no `text` field** (it is `transcript_received`, appended via
+   `add_transcript`). Crashed at tick 9 into a 4-attempt retry loop, each retry reloading the 9B.
+3. **`add_audio` was never called**, so `get_transcript_for_audio` would have returned `""`
+   forever *without raising* — a blank agent transcript for an entire baseline. Now `_record_audio`
+   is called at both `agent_audio_chunks.append` sites, with the *telephony* byte count, because
+   that is what `get_proportional_transcript` measures.
+4. **Three eval-path models are hardcoded `gpt-4.1` with no working CLI flag.** The post-episode
+   hallucination reviewer is the dangerous one: it runs by default, `--review-model` does not reach
+   it (`hallucination_reviewer.py:197` uses the config constant directly), and it is called outside
+   any try — so on a box with no OpenAI key it kills the process *after* the GPU time is spent. All
+   three now read env vars; `tau2_smoke_nemo.sh` points them at Bedrock. Two related traps: the
+   interruption/backchannel decision model fails *silently* (both call sites swallow it and return
+   `decision=False`, giving a materially different simulated user), and for voice runs
+   `results.json["simulations"]` is **always `[]` by design** — the records are the per-simulation
+   files plus `simulation_index`, so an empty list is not evidence a run was lost.
+
+Two external blockers remain, neither of them code. The **ElevenLabs key is free-tier** (10,000
+chars/month, ~7.9k left) — enough for smoke tests, nowhere near a 300-conversation baseline. And
+**all seven official τ-bench voice ids 404** on our key (they are private voices in Sierra's
+account); `scripts/tau2_stock_voices.env` substitutes stock library voices, which costs external
+leaderboard comparability and makes `regular`-complexity results meaningless, so pass
+`--speech-complexity control`.
+
 ### 0d. Produce the arm-A baseline
 
 Run A on a fixed task subset of all 3 test domains. Record reward rate, all four voice metrics,
 and tool-call parse rate. **Acceptance criterion for Phase 0: a baseline table exists.**
 
 This also tells us which failures dominate, which should re-prioritise everything below.
+
+Budget it against the measured 23.5× realtime (0b-bis), not the old 4.4× figure: ~1.4 GPU-h per
+200 s conversation. Fan out one episode per GPU from the start, and resolve the ElevenLabs quota
+before committing an allocation to it.
 
 ---
 
@@ -325,14 +517,30 @@ responses are only what it *reads*. Scalars and non-JSON results keep the string
 more is needed, elide long variant/list bodies — but the agent must still pick the right variant,
 so that is genuinely lossy and must be measured against task success, not token count.
 
-**1c. Raise `max_fc_total_tokens` to 12,000 and turn on `fc_log`. DONE in config, GPU-unvalidated.**
+**1c. Raise `max_fc_total_tokens` to 12,000 and turn on `fc_log`. DONE and GPU-validated.**
 Measured on the repaired shards with augmentation on: **8,389 / 8,137 / 8,254** — all three over
 8,000, so the old value would now discard 100 % of the corrected data. 1b's saving does not close
 the gap because 1a costs ~+2,000. 12,000 leaves 3.6–3.9k headroom on retail and is the smallest
 round value that also clears telecom (system prompt 6,903 alone). `fc_log: true` is now set —
 it defaults to `False`, which is exactly how 8,000 silently discarding everything would have gone
-unnoticed. **Still needs a GPU memory re-check:** a canonical retail cut is now ~10.9k sequence
-positions (4,478 prompt + 2,495 audio frames + 3,909 inserted FC), up from ~8.4k.
+unnoticed. **GPU smoke test (8 steps, one H200, log in `data/voicechat/fc_check2/`): passes.**
+Zero cuts dropped at 12,000 — the budget holds where 8,000 discarded 100 % of the repaired data.
+The function channel carries the trained layout (`<SPECIAL_20>` then
+`<TOOLCALL>[{"name": "find_user_id_by_name_zip"…`), with 6 response spans injected out to position
+~10,056, matching the ~10.9k predicted for a canonical retail cut (4,478 prompt + 2,495 audio
+frames + 3,909 inserted FC). Cost: **119,235 MiB of 143,771 MiB at `batch_size: 1`** — so batch
+size 1 is a hard requirement at this sequence length, not a conservative choice.
+
+**1c-bis. `augment_fc_system_prompt: true` is a no-op on our data — do not "fix" it at inference.**
+Worth stating because the flag reads as if the model trained on the ~150-token `<TOOLCALL>`
+instruction scaffold. It did not. `collate_system_prompt` (`s2s_dataset.py:2148`) resolves the
+prompt from `cut.custom["system_prompt"]` on its **first** branch and only augments on the
+following `elif`; our cuts populate `custom` (verified byte-identical to `supervisions[0].text`),
+so the wrap never fires. Consequence for Phase 0: the eval driver must send the **raw tools-only**
+prompt, wrapped as `[bos] + text_to_ids(prompt) + [eos]` (`:2220`) — adding the scaffold would
+itself be the train/test mismatch. Note `_get_fc_cut_total_prompt_tokens` (`:1209`) *does* augment
+when computing the drop decision, so the 12,000 budget above was measured with ~150 tokens of
+extra headroom; that direction is conservative and harmless.
 
 **1d. Compress inter-turn dead air.** Shift timestamps and cut silence from both waveforms in
 inter-turn gaps, targeting 0.3–0.8 s. Exact (both tracks are silent there), needs no TTS,
