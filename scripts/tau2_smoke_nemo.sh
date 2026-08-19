@@ -47,6 +47,14 @@ srun --jobid="$JOBID" --overlap bash -c "
   export MASTER_PORT=\$((29593 + $GPU))
   # The official tau-bench voice ids 404 on our ElevenLabs key; see the file's header.
   source '$HERE/tau2_stock_voices.env'
+  # ElevenLabs allows 2 CONCURRENT requests on our plan and 429s the rest with
+  # \`concurrent_limit_exceeded\`. tau2 does retry 429, but only 3 attempts at 1 s + 2 s,
+  # which killed 2 of 8 fanned-out episodes within 30 s of their first user utterance -- a
+  # TTS failure is fatal to the simulation, so that is an hour of GPU lost to a 3-second
+  # queue. 8 attempts with a 30 s ceiling gives ~90 s of tolerance. Not a quota problem:
+  # quota failures say \`character_limit\`, these said \`rate_limit_error\`.
+  export TAU2_RETRY_ATTEMPTS="\${TAU2_RETRY_ATTEMPTS:-8}"
+  export TAU2_RETRY_MAX_WAIT="\${TAU2_RETRY_MAX_WAIT:-30}"
   # The user simulator's interruption/backchannel decisions use their own hardcoded
   # model (config.VOICE_USER_SIMULATOR_DECISION_MODEL), which --user-llm does not touch.
   # Exported in the shell rather than put in .env because config.py reads it at import

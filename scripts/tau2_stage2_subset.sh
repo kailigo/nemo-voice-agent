@@ -63,19 +63,38 @@ ENV_PREFIX=/fsx/home/kai.li/miniforge3/envs/voicechat
 RUN="${RUN_NAME:-stage2_subset}"
 CAP_SECONDS="${CAP_SECONDS:-200}"
 NGPU="${NGPU:-8}"
+STAGGER_SECONDS="${STAGGER_SECONDS:-20}"
 LOGDIR="${LOGDIR:-$HERE/../logs/$RUN}"
+
+STAGGER_SECONDS="${STAGGER_SECONDS:-20}"
+# Retry mode, set by scripts/tau2_watch_run.sh: run exactly the episodes in this TSV
+# instead of the generated subset, keep the existing progress log, and write to distinct
+# `--save-to` directories so a half-written first attempt is neither resumed nor
+# overwritten (a same-named directory would route the retry into `try_resume`).
+REQUEUE_FILE="${REQUEUE_FILE:-}"
+NAME_SUFFIX="${NAME_SUFFIX:-}"
+if [[ -n "$REQUEUE_FILE" ]]; then
+  NAME_SUFFIX="${NAME_SUFFIX:-__retry}"
+fi
 
 mkdir -p "$LOGDIR"
 # Truncate rather than append: a stale progress.log from an aborted attempt makes the final
 # tally read as successes that never happened (the first launch's 7 OKs survived into the
-# second and were counted there).
-: >"$LOGDIR/progress.log"
+# second and were counted there). A retry pass is a continuation of the same run, so it
+# appends instead -- losing the first pass's record is exactly the bug above in reverse.
+if [[ -z "$REQUEUE_FILE" ]]; then
+  : >"$LOGDIR/progress.log"
+fi
 
 # --- build the job list -----------------------------------------------------
 # TSV rather than a shell array of ids: telecom ids contain `|` and `[]`
 # (`[mms_issue]airplane_mode_on|break_app_both_permissions[PERSONA:Hard]`), so they must
 # never pass through word splitting or eval. `read -r` with IFS=tab is the only safe path.
 JOBS="$LOGDIR/jobs.tsv"
+if [[ -n "$REQUEUE_FILE" ]]; then
+  JOBS="$REQUEUE_FILE"
+  echo "retry pass: $(wc -l <"$JOBS") episode(s) from $REQUEUE_FILE"
+else
 LD_LIBRARY_PATH="$ENV_PREFIX/lib:${LD_LIBRARY_PATH:-}" \
   "$ENV_PREFIX/bin/python" - "$HERE" >"$JOBS" <<'PY'
 import subprocess, sys, shlex
@@ -91,6 +110,7 @@ for line in out.splitlines():
     for task_id in shlex.split(rest):
         print(f"{domain}\t{task_id}")
 PY
+fi
 
 N_JOBS=$(wc -l <"$JOBS")
 echo "stage 2: $N_JOBS episodes over $NGPU GPUs, cap ${CAP_SECONDS}s, logs in $LOGDIR"
@@ -103,6 +123,11 @@ declare -a WORKER_PIDS=()
 
 for ((slot = 0; slot < NGPU; slot++)); do
   (
+    # Desynchronise the slots. All 8 episodes otherwise reach their first user utterance
+    # within the same second and contend for ElevenLabs' 2 concurrent request slots; the
+    # backoff in tau2_smoke_nemo.sh handles the collision, but not colliding is cheaper.
+    # 20 s x 8 slots costs 2.3 min of a 3-4 h run.
+    sleep $((slot * STAGGER_SECONDS))
     i=0
     while IFS=$'\t' read -r domain task_id; do
       if ((i % NGPU != slot)); then
@@ -113,8 +138,8 @@ for ((slot = 0; slot < NGPU; slot++)); do
 
       # Directory name must be filesystem-safe: telecom ids are not.
       slug=$(printf '%s' "$task_id" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)
-      name="$RUN/${domain}__${slug}"
-      log="$LOGDIR/gpu${slot}__${domain}__${slug}.log"
+      name="$RUN/${domain}__${slug}${NAME_SUFFIX}"
+      log="$LOGDIR/gpu${slot}__${domain}__${slug}${NAME_SUFFIX}.log"
 
       echo "[gpu $slot] START $domain $task_id" >>"$LOGDIR/progress.log"
       rc=0

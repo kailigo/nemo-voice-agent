@@ -641,6 +641,124 @@ artifact. Stage 2 can proceed on `SilenceTTS`; its reward number is as meaningfu
 
 ---
 
+### 0d-ter. PARKED 2026-08-19 on the ElevenLabs quota — and arm A's failure is three failures, not one
+
+Status: **stage 2 is stopped, not failed.** Resume when an ElevenLabs key with real quota exists.
+Everything else on the arm-A path works; the section below is what a resumed run should already know.
+
+**The blocker is characters, and it is measured, not inferred.** `GET /v1/user/subscription` returns
+`character_count: 9696` of `character_limit: 10000`, `tier: free`, reset **2026-09-11**. So 304
+characters remained, which is ~4 user turns. The 7 live episodes sat at ticks 213–398 of a 1,000-tick
+cap and needed ~6–8 more turns *each* (~45 turns, ~3,300 chars), so they could not finish and the 16
+unstarted ones would each have burned a 4.5-min model load to die at their first utterance. Stage 2's
+steps were cancelled (`scancel 1303.<n>`); the allocation was left held.
+
+**Do not confuse the two ElevenLabs limits.** They have different fixes and we hit only one:
+
+| limit | free tier | hit? | signature |
+|---|---|---|---|
+| concurrent requests | 2 | **yes, twice — survived** | HTTP 429, `rate_limit_error` / `concurrent_limit_exceeded` |
+| characters / month | 10,000 | not yet; 304 left | HTTP 429, `character_limit` |
+
+The concurrency 429 is *transient and self-healing*: `runner/progress.py::run_with_retry` re-ran the
+whole unit (`attempt 1/4`) and both affected episodes continued for another 28 min. **A mid-episode
+fault is therefore not evidence of a dead episode** — a watchdog that greps episode logs for
+`emergency cleanup` will requeue live work onto fresh GPUs. Only the fan-out's post-exit verdict in
+`progress.log` is authoritative. Mitigations already committed: env-overridable retry constants
+(`config.py`), 8 attempts / 30 s ceiling in `tau2_smoke_nemo.sh`, and `STAGGER_SECONDS` in
+`tau2_stage2_subset.sh`. Staggering alone will not save an 8-way fan-out against a 2-request cap.
+
+**Character economics, measured from `user_labels.txt` rather than extrapolated.** User turns scale
+linearly with ticks — 1 turn per ~103 ticks, holding at 100/101/99/113 across four independent
+episodes — and the labelled utterances are 43/142/90/57 chars, so **~74 chars/turn, ~740 per full
+200 s episode**. Therefore 24 episodes ≈ **18k chars** and stage 3's 254 ≈ **188k**, *per arm*. The
+free tier cannot fund one 24-episode diagnostic pass. Note the cost is coupled to whether the fix
+below works: episodes that die at 10 errors cost ~190 chars, ones that run the full cap cost ~740.
+
+**Arm A scores 0.000 for three separate reasons. 0d-bis named only the smallest of them.** The
+per-episode `artifacts/*/audio/*_labels.txt` files are the evidence — they carry utterance text with
+timestamps, and tool calls with timestamps, for every persisted episode:
+
+| # | failure | evidence | fixable by prompt? |
+|---|---|---|---|
+| a | ASR errors on proper nouns and spelled-out digits | user says *"Mei Ahmed … M, E, I … A, H, M, E, D … seven eight seven zero five"*; model calls `find_user_id_by_name_zip {"first_name":"May","last_name":"Amelia","zip":"78870"}` | **no — this is what SFT is for** |
+| b | fabricates a missing required argument instead of asking or switching tools | user: *"I don't remember it. Can't you look it up another way?"* → model calls `get_order_details {"order_id":"W0000000"}` | partly |
+| c | **no error recovery: verbatim repetition until `max_errors`** | 10 identical calls, 3.2 s apart, *after the user's audio has ended* | **yes, directly** |
+
+(c) is the one that sets the score. Every episode dies at ~60 s of a 200 s cap, so reward is
+structurally 0.000 independent of task difficulty:
+
+```
+retail 21   last user words 27.8s → calls at 33.0 36.2 39.4 42.6 45.8 49.0 52.2 55.4 58.6 61.8
+            get_order_details ×10, all {"order_id":"W0000000"}, all "Error: Order not found"
+retail 92   find_user_id_by_name_zip ×2 → find_user_id_by_zip → find_user_id_by_name ×7
+            args mutate May → Amelia → Maya; tool name decays into ones that do not exist
+```
+
+**This corrects 0d-bis: "the checkpoint invents tool names" is a symptom, not the disease.** In
+retail 92 the model's *first* call is `find_user_id_by_name_zip` — the correct tool, which exists —
+and the invented variants appear only after the error, as the repetition loop degenerates. Tool
+*selection* is substantially right on the first attempt, consistent with the model card's 82.5 % on
+Full-Duplex-Bench v3. The 27 % invented-name rate is the loop's output, so citing it as the target
+for SFT aims at the wrong thing.
+
+**The fix under test: the eval harness was omitting NVIDIA's tool-use protocol.** `provider.py` sent
+only `policy + <AVAILABLE_TOOLS>`. The released checkpoint was trained with
+`augment_fc_system_prompt: true` and NVIDIA's own inference entrypoint
+(`examples/speechlm2/offline_voicechat_fc_infer.py`) supplies a protocol scaffold whose rules map 1:1
+onto (b) and (c) — *"never guess … ask the user"*, and *"if a tool call fails … do not retry the tool
+call for the same request"*. Now sent, verbatim, via `_FC_PROTOCOL_RULES` +
+`DEFAULT_FC_SYSTEM_PROMPT_TEMPLATE`, gated by `NeMoDuplexConfig.fc_prompt_protocol` (default on) with
+a `nemo-base-bare-prompt` preset as the control. Confirmed reaching the model: prompt **4,838 tokens
+vs 4,575**. See the correction appended to 1c-bis — that section's reasoning is right for *our* cuts
+and backwards for the *released* checkpoint.
+
+**A second defect found while validating: telecom's policy contains 18 non-ASCII characters** (emoji
+📶📵📡✈️📱🔽🔒🔋 and superscripts ¹²³⁴) and the model card requires ASCII-only system prompts — so 8
+of 24 episodes were malformed. `_to_ascii()` now NFKD-folds and warns with a codepoint histogram.
+
+**Partial paired evidence, and it is only partial.** Two protocol-run episodes passed the tick depth
+at which their bare-prompt controls died, with no `too_many_errors` anywhere in the run:
+
+| episode | control | with protocol |
+|---|---|---|
+| retail 78 | 288 → `too_many_errors` | **380, running** |
+| retail 92 | 319 → `too_many_errors` | **398, running** |
+
+No episode persisted before the quota ran out, so **there is no post-fix reward number and no
+post-fix tool-call table.** Do not cite one.
+
+**The experiment to run first on resume — it needs zero characters.** `both.wav` is **stereo 8 kHz,
+one channel per speaker**, so every persisted episode contains the real, already-paid-for user audio,
+and the label files give the control's exact calls. Replaying that channel into the model with the
+bare vs protocol prompt, executing calls against the real environment
+(`registry.get_env_constructor("retail")()` → `make_tool_call`, which reproduces `Error: Order not
+found` exactly), is a paired deterministic A/B where the *only* variable is the prompt.
+`scripts/check_streaming_driver.py` already has the pieces: `build_session`, `drive()` (200 ms ticks,
+`<SOTC>` detection), and `push_tool_result`. Four episodes × 2 prompts = 8 runs ≈ one 8-GPU wave,
+~15 min each. Metric: consecutive identical calls, and whether the model *speaks* after the first
+error instead of retrying. This settles (b) and (c) but cannot settle (a).
+
+**ElevenLabs is used for TTS only — so it is replaceable.** Verified, not assumed: two call sites,
+both text-to-speech (`elevenlabs_utils.py:90` `text_to_speech.convert` for user utterances, and
+`synthesis/audio_effects/speech_generator.py` for `[cough]`/`[sneeze]`/disfluency inserts, which also
+bill). **No STT** — transcription is Deepgram `nova-3` *if enabled*, and it is not: `batch.py:497`
+and `build.py:235` both pass `transcription_config=None`, which is also why `user_transcript` is
+empty in every persisted tick and the text survives only in `*_labels.txt`. `setup_voices.py` does
+call `text_to_voice.design`/`voices.create`, but we never run it (the official tau-bench voice IDs
+404 on our key; stock IDs come from `tau2_stock_voices.env`). Nothing needs an ElevenLabs *voice*,
+*model*, or *transcription* — only PCM_S16LE mono @ 16 kHz bytes for a string.
+
+So a local TTS drops in behind one seam: `synthesis/synthesize.py:22` dispatches on the provider
+string and `data_model/voice.py:327` raises on anything but `"elevenlabs"`. `nemo.collections.tts` is
+already installed in the voicechat env (import it with `LD_LIBRARY_PATH=$ENV_PREFIX/lib`, per the
+env recipe, or `_sqlite3` fails on `CXXABI_1.3.15`). The cost is voice identity: `tasks_voice.json`
+assigns a per-task `voice_id` across 114 retail tasks, so a single-speaker local model removes
+speaker variation as a difficulty axis — a mild bias in arm A's favour, to be **stated in the
+results, not hidden**. Decision deferred: the user is obtaining an API key.
+
+---
+
 ## 4. Phase 1 — Data generator fixes
 
 All CPU-only. In `nemo-voice-agent/scripts/episodes_to_nemotron_training.py` unless noted.
@@ -684,11 +802,20 @@ Worth stating because the flag reads as if the model trained on the ~150-token `
 instruction scaffold. It did not. `collate_system_prompt` (`s2s_dataset.py:2148`) resolves the
 prompt from `cut.custom["system_prompt"]` on its **first** branch and only augments on the
 following `elif`; our cuts populate `custom` (verified byte-identical to `supervisions[0].text`),
-so the wrap never fires. Consequence for Phase 0: the eval driver must send the **raw tools-only**
-prompt, wrapped as `[bos] + text_to_ids(prompt) + [eos]` (`:2220`) — adding the scaffold would
-itself be the train/test mismatch. Note `_get_fc_cut_total_prompt_tokens` (`:1209`) *does* augment
+so the wrap never fires. Note `_get_fc_cut_total_prompt_tokens` (`:1209`) *does* augment
 when computing the drop decision, so the 12,000 budget above was measured with ~150 tokens of
 extra headroom; that direction is conservative and harmless.
+
+> **CORRECTION (2026-08-19) — this section's scope was wrong, and it cost ~10 GPU-hours.** It
+> previously concluded "the eval driver must send the **raw tools-only** prompt … adding the scaffold
+> would itself be the train/test mismatch." That holds only for a checkpoint finetuned on **our**
+> cuts. It is backwards for the **released** `NVIDIA-NemotronLabs-VoiceChat-11B`, which NVIDIA trained
+> *with* `augment_fc_system_prompt: true` on *their* data and which their own inference entrypoint
+> (`examples/speechlm2/offline_voicechat_fc_infer.py`) serves *with* the protocol scaffold. Sending it
+> the bare prompt is itself the mismatch — see 0d-ter for the three failure modes that follow. The
+> rule is per-checkpoint: **bare prompt for our SFT'd models, protocol scaffold for the released
+> one.** The `[bos] + text_to_ids(prompt) + [eos]` wrapping (`:2220`) is unaffected and still required
+> in both cases.
 
 **1d. Compress inter-turn dead air.** Shift timestamps and cut silence from both waveforms in
 inter-turn gaps, targeting 0.3–0.8 s. Exact (both tracks are silent there), needs no TTS,
@@ -800,6 +927,7 @@ the released 11B was trained with these unfrozen, so freezing changes the recipe
 | 7 | New domains are stylistic clones → optimistic transfer | medium | deliberate diversity in authoring |
 | 8 | Overfitting / forgetting policy-following ability | medium | Phase 4 mitigations |
 | 9 | Success-filtering keeps only easy tasks | low-medium | track coverage, keep failures |
+| 10 | **User-simulator TTS quota — MATERIALIZED 2026-08-19, stage 2 parked.** ElevenLabs is the only TTS path and the free tier is 10,000 chars/month; a 24-episode diagnostic needs ~18k and stage 3 ~188k *per arm*. Nothing else on the eval path is blocked. | **high** | paid key (in progress), or a local TTS behind `synthesize.py:22`; see 0d-ter |
 
 ---
 
