@@ -185,6 +185,71 @@ def build_tools(agent_file: Path | None = None) -> List[Any]:
     return [Tool(_synthesise(*p)) for p in parsed]
 
 
+# NVIDIA's own inference-time FC prompt renderer and its default system message, both from
+# `examples/speechlm2/offline_voicechat_fc_infer.py` -- the entrypoint the model card points
+# at for offline function calling.
+_NEMO_REPO = Path("/fsx/home/kai.li/code/nemo-voice-agent")
+FC_TEMPLATE = _NEMO_REPO / "examples/speechlm2/function_calling/template.jinja"
+
+
+def nvidia_default_system_message() -> str:
+    """``DEFAULT_SYSTEM_MESSAGE`` from NVIDIA's offline FC entrypoint, read off the file.
+
+    Not used by default: FDB-v3's published table gave every provider the benchmark's own
+    ``VoiceAgent`` instructions, and prepending NVIDIA's persona and decision-process text
+    would be a prompt no other row in that table saw. It is here because NVIDIA evaluating
+    their own model plausibly *did* include it, which makes it worth one control arm rather
+    than a guess.
+    """
+    script = _NEMO_REPO / "examples/speechlm2/offline_voicechat_fc_infer.py"
+    tree = ast.parse(script.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "DEFAULT_SYSTEM_MESSAGE" for t in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise ValueError(f"DEFAULT_SYSTEM_MESSAGE not found in {script}.")
+
+
+def render_system_prompt(system_message: str, tools, template: Path | None = None) -> str:
+    """Render the FC system prompt through NVIDIA's own Jinja template.
+
+    Why not our own serialiser: the template does three things ``Tool.openai_schema`` does
+    not, and the difference is visible to the model.
+
+      ours   : {"type":"function","function":{"name":"track_order","description":...}}
+      theirs : {"description": ..., "name": "track_order", "parameters": {...}}
+
+    It unwraps ``function``, drops the ``type`` key, sorts the JSON keys (Jinja's ``tojson``)
+    and separates entries with ``", "`` rather than ``","``. NeMo's own example of a trained
+    tool block (``s2s_dataset.py:1159``) is the flattened form too, so the wrapped form is
+    not what the checkpoint saw at training *or* inference time. Prompt-format drift is the
+    error class this whole module exists to prevent, so the rendering is theirs, from their
+    file, not a reimplementation of it.
+
+    ``system_message`` goes in ahead of the tool block; the template supplies the
+    <TOOLCALL>/<TOOL_RESPONSE> protocol paragraphs itself.
+    """
+    from jinja2 import Environment
+
+    path = template or FC_TEMPLATE
+    if not path.exists():
+        raise FileNotFoundError(
+            f"NVIDIA's FC prompt template is missing: {path}. Rendering the tool block "
+            f"ourselves instead would silently change the prompt format."
+        )
+    schemas = [t.openai_schema if hasattr(t, "openai_schema") else t for t in tools]
+    rendered = Environment().from_string(path.read_text()).render(
+        system_message=system_message, tools=schemas
+    )
+    if "<AVAILABLE_TOOLS>" not in rendered:
+        raise ValueError(
+            "Rendered prompt has no <AVAILABLE_TOOLS> block -- the template's `tools` "
+            "contract has changed. Re-read it before running an eval."
+        )
+    return rendered
+
+
 def build_registry(latency_profile: str = "instant"):
     """The benchmark's own ``MockAPIRegistry``, imported from its directory.
 

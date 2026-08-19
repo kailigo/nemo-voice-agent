@@ -29,6 +29,12 @@ What is faithful, and what is not
 Faithful:
   * Tool set, tool descriptions, parameter descriptions and agent instructions are parsed
     out of `lk_agent_tool.py` itself (see fdb_v3_tools.py) -- not transcribed.
+  * The system prompt is rendered by NVIDIA's own `function_calling/template.jinja`, the
+    one their offline FC entrypoint uses. Our `Tool.openai_schema` block is a different
+    format -- wrapped in {"type":"function","function":{...}}, unsorted keys -- and NeMo's
+    own example of a trained tool block (`s2s_dataset.py:1159`) is the flattened form the
+    template produces, so the wrapped form matches neither training nor their inference.
+    `--prompt-style tau2_provider` keeps the wrapped form for an A/B on what it costs.
   * Tool execution goes through the benchmark's own `MockAPIRegistry`, at the `instant`
     latency profile the released `run_agent.sh` uses.
   * Tool results are handed back as `json.dumps(result)`, byte-for-byte what
@@ -292,6 +298,8 @@ def _payload(example_dir, metadata, args, *, status, text, chunks, first_text_at
             "tool_call_logging": "actual_tool_calls holds only calls that would execute "
                                  "under LiveKit; see rejected_tool_calls",
             "tool_response_style": args.tool_response_style,
+            "prompt_style": args.prompt_style,
+            "system_message": args.system_message,
             "fc_prompt_protocol": bool(provider.config.fc_prompt_protocol),
         },
         "rejected_tool_calls": executor.rejected,
@@ -336,6 +344,18 @@ def main() -> int:
     p.add_argument("--tool-response-style", choices=("json", "sentence"), default="json",
                    help="json (default) is what the benchmark's LiveKit agent returns. "
                         "sentence follows the model card's TTS-friendly recommendation.")
+    p.add_argument("--prompt-style", choices=("nvidia_template", "tau2_provider"),
+                   default="nvidia_template",
+                   help="nvidia_template (default) renders the system prompt through "
+                        "NVIDIA's own function_calling/template.jinja -- flattened tools, "
+                        "no 'type' key, sorted JSON keys. tau2_provider uses our "
+                        "Tool.openai_schema block, which is what a tau2 run sends; kept "
+                        "only to measure what the format difference is worth.")
+    p.add_argument("--system-message", choices=("benchmark", "nvidia+benchmark"),
+                   default="benchmark",
+                   help="benchmark (default) = the FDB-v3 VoiceAgent instructions alone, "
+                        "which is what every provider in the published table got. "
+                        "nvidia+benchmark prepends NVIDIA's DEFAULT_SYSTEM_MESSAGE.")
     p.add_argument("--max-fc-tokens", type=int, default=2000,
                    help="LM positions reserved for function tokens. Adds to the "
                         "preallocated horizon, which inference is O(T^2) in, so the model "
@@ -353,13 +373,22 @@ def main() -> int:
     sys.path.insert(0, str(TAU2_SRC))
     sys.path.insert(0, str(HERE))
 
-    from fdb_v3_tools import build_registry, build_tools, extract_instructions
+    from fdb_v3_tools import (
+        build_registry,
+        build_tools,
+        extract_instructions,
+        nvidia_default_system_message,
+        render_system_prompt,
+    )
     from tau2.voice.audio_native.nemo.config import get_nemo_config
     from tau2.voice.audio_native.nemo.provider import NeMoDuplexProvider
 
     tools = build_tools()
     registry = build_registry(latency_profile="instant")
-    args.instructions = extract_instructions()
+
+    system_message = extract_instructions()
+    if args.system_message == "nvidia+benchmark":
+        system_message = f"{nvidia_default_system_message()}\n\n{system_message}"
 
     examples = discover(args.data_dir)
     if args.num_shards > 1:
@@ -374,6 +403,17 @@ def main() -> int:
         return 0
 
     config = get_nemo_config(args.cascaded_config)
+    if args.prompt_style == "nvidia_template":
+        # Render once: the prompt is identical for every example, and the provider must not
+        # append a tool block of its own on top of the one the template already wrote.
+        args.instructions = render_system_prompt(system_message, tools)
+        config.system_prompt_verbatim = True
+    else:
+        args.instructions = system_message
+        config.system_prompt_verbatim = False
+    print(f"prompt: style={args.prompt_style} system_message={args.system_message} "
+          f"{len(args.instructions)} chars, ascii={args.instructions.isascii()}", flush=True)
+
     provider = NeMoDuplexProvider(config)
 
     failures = 0

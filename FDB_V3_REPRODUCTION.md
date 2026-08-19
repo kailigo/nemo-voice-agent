@@ -6,7 +6,7 @@ reports three FDB-v3 numbers:
 | metric | card |
 | --- | --- |
 | Tool Selection | **82.5 %** |
-| Argument accuracy | **42.2 %** |
+| Argument accuracy | **44.2 %** |
 | Pass@1 | **33 %** |
 
 This document is the audit trail for reproducing them with the released checkpoint: what the
@@ -27,10 +27,46 @@ end to end, it decomposes:
 * **The three evaluators never touch LiveKit.** They glob `result_{provider}.json` and score
   JSON. `evaluate_tool_calls.py:640-652`.
 
-So the transport is not load-bearing for any published metric, and LiveKit is replaceable by
-a local replay. Which is necessary anyway: our model is 11B of weights in-process, and with
-no KV cache (Nemotron-Nano is hybrid Mamba2, so it re-reads full history each step) inference
-runs at ~12x slower than realtime — it cannot hold a realtime WebRTC session open.
+So the transport is not load-bearing for any published metric: LiveKit is replaceable by any
+client that can stream the WAV and log the tool calls.
+
+### Which of the two inference paths to measure
+
+This mattered more than anything else in the setup, and I got it wrong first.
+
+* The **eager research path** in this repo (`duplex_stt_model.py:3718-3722`) hard-disables the
+  LLM cache for Nemotron — it logs *"Using no-cache mode for Nemotron (full history each
+  step)"* — so it recomputes the whole conversation every frame. Measured: **12.2x slower than
+  realtime** on an H200. NVIDIA's own `offline_voicechat_fc_infer.py` runs this path too,
+  which is why it looks canonical.
+* The **served path** is the NIM container (`voicechat_realtime_instructions/`, CUDA + Triton +
+  vLLM, one GPU, ~66 GB), which the model card's "Interactive streaming deployment" section
+  points at. vLLM logs `GPU KV cache size: 1,105,920 tokens` at startup.
+
+Measured on the container, 2026-08-19, one H200 (`scripts/voicechat_realtime_latency.py`):
+
+| | NVIDIA's `what_is_your_name.wav` | FDB-v3 `ecommerce_01`, 45.8 s |
+| --- | --- | --- |
+| wall / input audio | 1.002 | 1.001 |
+| output audio / arrival span | 1.01 | 1.02 |
+| chunks dropped | 0 | 0 |
+| turn-taking latency (ASR end-of-speech → agent speech onset) | 794 ms | 476 ms, 639 ms |
+| inferences per second of audio | 6.27 | 6.25 |
+
+The card quotes 448 ms smooth turn-taking latency; ours is measured from the server's own ASR
+end-of-speech marker, which lags the acoustic end, so these are if anything pessimistic.
+
+The two paths also *behave* differently, so this is not only a cost question. On `ecommerce_01`
+the research path hallucinated `order_id: "LHR"`; the container returned
+`track_order({"order_id": "A-BC123"})` for a user who spells "a B C one two three" out loud —
+right tool, near-miss argument, which is the shape of the published 82.5 % / 44.2 %.
+
+**Everything below is therefore measured through the container, not the research path.** Note
+that the container is built from the *released* checkpoint: our locally remapped
+`stt_extracted_lora` is missing all 635 `tts_model.*` tensors and cannot speak. (Weight
+provenance is verified separately by `scripts/verify_checkpoint_identity.py`: 982 tensors match
+after name normalisation and 11/11 sampled are bit-identical, so the shared trunk *is* the
+released weights, renamed.)
 
 Credential requirements, per metric:
 
@@ -55,18 +91,28 @@ count before scoring for exactly that reason.
 ## 3. What we run
 
 ```
-scripts/fdb_v3_tools.py        # the 12 tools + agent instructions, parsed out of lk_agent_tool.py
-scripts/fdb_v3_nemo_infer.py   # local replay -> result_{provider}.json
-scripts/fdb_v3_fanout.sh       # 8 shards, one persistent worker per GPU
-scripts/fdb_v3_asr_input.py    # Parakeet over input.wav -> user_speech_end_rel (latency only)
-scripts/fdb_v3_evaluate.py     # the benchmark's own evaluators, Bedrock judge patched in
+scripts/fdb_v3_tools.py                # the 12 tools + agent instructions, parsed out of lk_agent_tool.py
+scripts/voicechat_realtime_latency.py  # realtime client: latency, realtime headroom, tool calls
+scripts/fdb_v3_asr_input.py            # Parakeet over input.wav -> user_speech_end_rel (latency only)
+scripts/fdb_v3_evaluate.py             # the benchmark's own evaluators, Bedrock judge patched in
+scripts/fdb_v3_nemo_infer.py           # research-path replay; kept only as the A/B against the container
+scripts/fdb_v3_fanout.sh               # 8 shards for the research-path replay
 ```
 
+Serving, per `voicechat_realtime_instructions/` (docker on these nodes has no `nvidia` runtime,
+so the container runs under `srun` + pyxis/enroot instead of `docker run`; the image pulls
+anonymously from `nvcr.io`, no NGC key):
+
 ```bash
-scripts/fdb_v3_fanout.sh 1303 --provider nemo          # ~2 h wall on 8 GPUs
-python scripts/fdb_v3_asr_input.py --provider nemo     # after, for the latency section
-python scripts/fdb_v3_evaluate.py --provider nemo
+enroot import -o /fsx/home/kai.li/data/containers/nemotron-labs-voicechat.sqsh \
+  docker://nvcr.io#nim/nvidia/nemotron-labs-voicechat:latest        # 11.3 GB -> 19.5 GB sqsh
+# then, inside an allocation: NEMO_CHECKPOINT_PATH=/checkpoint /s2s/deploy_s2s_model.sh   (~12 min, 31 GB)
+#                             NIM_HTTP_API_PORT=9000 /s2s/run_s2s_server.sh               (~6 min to ready)
+curl http://<node>:9000/v1/realtime/health
 ```
+
+The per-example driver against that server is the piece still being written; the client above
+already streams one example end to end with tools registered.
 
 **Faithful to the published setup:**
 
@@ -87,20 +133,22 @@ python scripts/fdb_v3_evaluate.py --provider nemo
   `log_tool_call`, so those calls are invisible to the published F1; counting ours would
   penalise our precision for failures the reference silently drops. Rejects are kept in
   `rejected_tool_calls`, which is the best diagnostic in the result file.
-* Audio plus 1.5 s of trailing silence, matching `livekit_inference.py:270-282`. The WAVs
-  already contain the response gap (median ~47 s of file for ~10 s of speech).
+* Audio plus trailing silence. `livekit_inference.py:270-282` appends 1.5 s; the WAVs already
+  contain the response gap (median ~47 s of file for ~10 s of speech). The container needs more
+  than LiveKit did — it is full duplex and only emits while input flows, so `deploy.md`
+  recommends ~20 s of trailing silence or the final reply is truncated mid-sentence.
 
 **Deviations, each stated in every result file's `notes` block:**
 
-1. **No LiveKit.** Local replay at 16 kHz into `DuplexSTTModel`, 80 ms frames.
-2. **`transcript` is the model's text channel, not ASR of synthesised speech.** This
-   checkpoint returns `tokens_audio: None` — the agent channel is text. So
-   `audio_agent_speech_start` is *first-token* time, not first-speech time. Tool selection
-   and argument accuracy do not depend on this; latency and response quality do, and are not
-   comparable to the published table.
-3. **Audio-clock timestamps**, not wall clock. Wall clock would measure our GPU (12x slower
-   than realtime), not the model's turn-taking.
-4. **The judge is Claude Sonnet 4.5 via Bedrock, not gpt-4o.** We have no OpenAI key;
+1. **No LiveKit.** The WAV is streamed to the container's `/v1/realtime` WebSocket at 24 kHz
+   PCM16 in 80 ms chunks, paced at true realtime, which is what LiveKit would have done to a
+   hosted realtime API. Tool schemas are registered flat (`{name, description, parameters}`)
+   via `session.update`, so the *server* renders the function-calling prompt from its own
+   `/s2s/prompt_template.jinja` — our earlier hand-rolled tool block is no longer in the loop.
+2. **The prompt is the benchmark's `VoiceAgent` instructions only.** NVIDIA plausibly used
+   their own persona text when producing the card's numbers; that is a separate arm, not the
+   default, because no other row in the published table saw it.
+3. **The judge is Claude Sonnet 4.5 via Bedrock, not gpt-4o.** We have no OpenAI key;
    Bedrock authenticates off the instance IAM role. The metric definition is unchanged and
    the prompts are the benchmark's own, but a stricter or looser judge moves argument
    accuracy and Pass@1 directly. Tool Selection is unaffected — it never calls the judge.
@@ -113,23 +161,27 @@ present rather than leaving the judge pointed at OpenAI.
 
 ## 4. Results
 
-Probe (1 example, `ecommerce_01`, 2026-08-19) — the harness end to end before committing GPU
-hours to it:
+Probe, `ecommerce_01`, 2026-08-19, through the container with all 12 tools registered:
 
 ```
-status=completed rtf=12.18 expected=['track_order'] got=['track_order'] rejected=0
-transcript: "Your order LHR has been received and is now out for delivery."
+tool call @16.87s  track_order({"order_id": "A-BC123"})
+agent: "I can track that order of your for you. Your order has been received and is now in transit."
+user speech end 10.79s -> agent speech onset 11.27s   latency 476 ms
+user speech end 18.47s -> agent speech onset 19.11s   latency 639 ms
+wall/audio 1.001   output_realtime_ratio 1.02   chunks_dropped 0
 ```
 
-Tool selection correct; the argument is a hallucination. The user spells "A-B-C-1-2-3" out
-loud (`acting_notes`: "Say the order ID clearly, one character at a time"), expected
-`order_id: "ABC123"`, the model emitted `order_id: "LHR"` — an airport code, from a different
-domain's tool. That single example matches the *shape* of the published result: high tool
-selection, argument accuracy roughly half of it.
+Right tool; the argument is a near-miss on formatting — the user spells "a B C one two three"
+out loud (`acting_notes`: "Say the order ID clearly, one character at a time"), expected
+`order_id: "ABC123"`, got `"A-BC123"`. That is the shape of the published result: high tool
+selection, argument accuracy roughly half of it. For contrast, the research path on the same
+example emitted `order_id: "LHR"` — an airport code, from a different domain's tool.
 
-Cost, measured: 12.18x realtime, 577 s for a 47 s example, 97 GB on an H200 at 84 %
-utilisation (so one worker per GPU, not two). 78.6 min of benchmark audio ≈ 16 GPU-hours ≈
-2 h wall on 8 GPUs.
+Cost: realtime. 78.6 min of benchmark audio is ~79 min on one GPU, ~12 min wall across the 8
+in an allocation with one server per GPU. (The research-path replay would have been ~16
+GPU-hours; that arm is now only worth running as a deliberate A/B.)
+
+Full 100-example run: **not yet run through the container.** Nothing is quoted before it lands.
 
 Full 100-example run: **in progress** (launched 2026-08-19 20:39 UTC on allocation 1303).
 Numbers go here when it lands — nothing is quoted before then.
