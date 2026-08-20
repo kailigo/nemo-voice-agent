@@ -757,6 +757,76 @@ assigns a per-task `voice_id` across 114 retail tasks, so a single-speaker local
 speaker variation as a difficulty axis — a mild bias in arm A's favour, to be **stated in the
 results, not hidden**. Decision deferred: the user is obtaining an API key.
 
+### 0e. A second agent provider, `nemo_rt`, for the NIM container (2026-08-20)
+
+The provider in 0a (`nemo`) drives the eager research path in-process. That path hard-sets
+`cache=None` (`duplex_stt_model.py:3718`) and its agent channel is text, so it is registered
+`cascaded` and needs a TTS. The NIM container is the *other* inference path — realtime, and it
+ships the speech decoder — so it gets its own provider, `nemo_rt`, registered `audio_native`.
+Committed in tau-voice-2 as `src/tau2/voice/audio_native/nemo_rt/` (`9cab3f7`); **offline-verified
+only, it has not yet talked to a live container.**
+
+It subclasses `OpenAIRealtimeProvider` / `DiscreteTimeOpenAIAdapter` rather than copying them —
+the container's protocol is a strict subset of OpenAI Realtime for every event we consume. The
+overrides are all forced by things read out of `audio_server.py`, and two of them are traps that
+produce healthy-looking runs:
+
+- **An out-of-range input rate silently discards the whole session config.** `handle_session_update`
+  validates the rate first and `return`s at `:1527` *before* reading `tools` or `instructions`, so
+  the episode runs on the container's `DEFAULT_INSTRUCTIONS` with no tools, and
+  `handle_function_call_output` then refuses results with `tools_not_set`. Symptom: an agent that
+  chats pleasantly and never calls anything. Valid range is 16000–48000; the provider rejects
+  anything else at construction.
+- **The prompt is only dispatched before the first audio chunk** (`:1574`, gated on
+  `sequence_started`). A later `session.update` is ACKed with `session.updated` and dropped.
+- **`speech_started` / `speech_stopped` carry `audio_start_ms` / `audio_end_ms` hardcoded to `0`**
+  (`:905`, `:920`, both labelled "Pipecat/OpenAI Realtime compatibility"). Feeding that `0` into
+  `TickResult.truncate_agent_audio` makes `get_played_agent_audio` compute `max_bytes = 0`, so
+  **every barge-in replaces the agent's whole in-flight utterance with silence** — measured on a
+  200 ms tick carrying 200 ms of tone: 1600 bytes returned, **0 audible**. And it is not reported:
+  `discarded = received - len(played)` is `1600 - 1600 = 0`, so `truncated_audio_bytes` stays 0
+  while the audio is gone. Note this contradicts 0a's third bullet — `truncate_agent_audio` is the
+  right call for `nemo`, where we know the offset, and the wrong one here. `nemo_rt` follows Qwen's
+  precedent instead: mark `was_truncated`, leave `interruption_audio_start_ms` unset, cap at the
+  tick boundary.
+- **No `UsageRecord`.** `response.done`'s usage block is hardcoded zeros (`:1015`), and a recorded
+  zero reads as "measured: free" rather than "not reported". Self-hosted cost is GPU-hours.
+- Output is always 24 kHz PCM16 — the negotiation branch at `:1550` compares formats, not rates,
+  and both sides are `"pcm16"`, so it is unreachable. `conversation.item.truncate` and
+  `response.create` are among the message types the server silently ignores.
+
+**The launch-flag gate for arm C: `telecom` does not fit the container's prompt limit on the
+default branch.** `MAX_INSTRUCTIONS_LENGTH = 32000` is checked against the *fully rendered* prompt
+(`prompt = build_prompt(...)`, then `len(prompt) > MAX` → `_emit_error` + `return`, with **no**
+`session.updated` sent). Rendered with the container's own `prompt_template.jinja` and
+`TOOLS_TEMPLATE`, per domain, in characters:
+
+| domain | jinja | default | jinja headroom | default headroom |
+|---|---|---|---|---|
+| telecom | 31,102 | **32,622** | 898 | **over by 622** |
+| telecom-workflow | 29,948 | 31,468 | 2,052 | 532 |
+| retail | 20,383 | 21,373 | 11,617 | 10,627 |
+| airline | 20,128 | 21,283 | 11,872 | 10,717 |
+| healthcare … restaurant (10 domains) | 9,808–13,408 | 11,243–14,658 | ≥18,592 | ≥17,342 |
+| mock | 3,186 | 4,721 | 28,814 | 27,279 |
+
+(`banking_knowledge` not measured — `ModuleNotFoundError` on its env constructor.) So **the
+container must be launched with `USE_JINJA_TEMPLATE_PROMPT=1`** or telecom silently runs with no
+prompt and no tools. That is a second, independent reason for the flag — the first, from
+`FDB_V3_REPRODUCTION.md` §3.2, is that the default branch appends 2,158 chars of tool-restraint
+text that contradicts the domain policy. `scripts/fdb_v3_serve.sh` already defaults to `jinja`.
+
+`NemotronRealtimeProvider._preflight_prompt_length` computes both branch totals **byte-exactly**
+before sending (verified equal to the real render on all 15 loadable domains) and logs `error` if
+over on both, `warning` if over only on the default branch, `info` above 95 %. Exactness matters
+here: the two branches escape the tool JSON differently — the default joins
+`json.dumps(ensure_ascii=False)`, jinja uses `tojson`, i.e. `sort_keys=True` plus markupsafe's
+`< > & '` escaping — which swings retail's tool block by 560 chars and airline's by 395, so one
+averaged constant would misjudge exactly the domains near the limit.
+
+This limit is unrelated to §2b's `max_fc_total_tokens: 8000`: that one is a *training* budget in
+tokens and it drops cuts; this one is a *serving* budget in characters and it drops the config.
+
 ---
 
 ## 4. Phase 1 — Data generator fixes
@@ -947,6 +1017,7 @@ the released 11B was trained with these unfrozen, so freezing changes the recipe
 | 8 | Overfitting / forgetting policy-following ability | medium | Phase 4 mitigations |
 | 9 | Success-filtering keeps only easy tasks | low-medium | track coverage, keep failures |
 | 10 | **User-simulator TTS quota — MATERIALIZED 2026-08-19, stage 2 parked.** ElevenLabs is the only TTS path and the free tier is 10,000 chars/month; a 24-episode diagnostic needs ~18k and stage 3 ~188k *per arm*. Nothing else on the eval path is blocked. | **high** | paid key (in progress), or a local TTS behind `synthesize.py:22`; see 0d-ter |
+| 11 | **A container launched without `USE_JINJA_TEMPLATE_PROMPT=1` runs telecom with no prompt and no tools, and the handshake still looks healthy** (32,622 rendered chars vs the 32,000 limit; the server returns before sending `session.updated`). telecom-workflow clears it by only 532. | **high** | `fdb_v3_serve.sh` defaults to `jinja`; `_preflight_prompt_length` warns per branch before the session starts; see 0e |
 
 ---
 
