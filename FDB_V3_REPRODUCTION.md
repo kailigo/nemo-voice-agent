@@ -181,7 +181,67 @@ Cost: realtime. 78.6 min of benchmark audio is ~79 min on one GPU, ~12 min wall 
 in an allocation with one server per GPU. (The research-path replay would have been ~16
 GPU-hours; that arm is now only worth running as a deliberate A/B.)
 
-Full 100-example run: **not yet run through the container.** Nothing is quoted before it lands.
+### Full 100-example run, 2026-08-19
 
-Full 100-example run: **in progress** (launched 2026-08-19 20:39 UTC on allocation 1303).
-Numbers go here when it lands — nothing is quoted before then.
+`scripts/fdb_v3_realtime_infer.py --provider nemo_rt` over all 100 audio folders on one H200,
+then `scripts/fdb_v3_evaluate.py --provider nemo_rt` with the Bedrock judge (274 judge calls, 0
+failures).
+
+Coverage: **99 completed, 1 `inference_error`**, 2 silent. The failure is
+`ecommerce_20_66c4f3cb14cbfc4db836bd4e`, and it is **deterministic, not a race** — three
+attempts (`scripts/fdb_v3_retry_failures.sh`, 2 rounds) all died the same way, so the earlier
+"race" reading was wrong for this example. The mechanism is the released Triton backend's
+degenerate-tool-call recovery: the model opens a tool call and never emits the end-of-tool-call
+token → `Fast extract: exceeded 512 steps without eotc_id` → the vLLM request meanwhile hits
+EOS → `append_request: request '…' not found` → HTTP 500 → WebSocket 1011. It is left in place
+and scored as a no-response rather than retried away.
+
+| metric | ours (n=98) | ours (n=100) | card | judge? |
+| --- | --- | --- | --- | --- |
+| Tool Selection | **73.1 %** | 71.7 % | 82.5 % | **no** |
+| Argument accuracy | **51.7 %** | 50.7 % | 44.2 % | yes |
+| Pass@1 | — | **35.0 %** | 33.0 % | yes |
+
+Turn-taking 98/100. `n=98` drops the two samples that produced no output; `n=100` scores them 0.
+The card does not say which convention it quotes, so both are reported.
+
+**The two misses point in opposite directions and cancel in Pass@1** — which is why Pass@1 lands
+on target and is the weakest of the three as evidence. The split falls exactly along whether the
+judge is involved:
+
+* **Argument accuracy overshoots by 7.5 pts, and it is judge-mediated.** Sonnet 4.5 being more
+  permissive than gpt-4o on semantic argument matching is the leading explanation; a stricter
+  judge moves this number directly and we cannot settle it without an OpenAI key. Beating the
+  card here is not a result to claim.
+* **Tool Selection undershoots by 9.4 pts, and it uses no judge at all** —
+  `evaluate_tool_calls.py::evaluate_tool_selection` is multiset F1 over tool *names*, pure set
+  arithmetic. So this gap is real and cannot be attributed to the substitution. **This is the
+  one number that does not reproduce.**
+
+Where Tool Selection loses, per `logs/fdb_v3/nemo_rt_evaluation_report.json`:
+
+| cut | value |
+| --- | --- |
+| mean recall / mean precision | 0.789 / 0.862 |
+| scenarios losing precision only / recall only | 19 / 20 |
+| total calls emitted vs expected | 184 vs 150 (**1.23x — the model over-calls**) |
+| call-count shape | 52 right, 27 over, 21 under |
+| by difficulty (easy / medium / hard) | 0.758 / 0.770 / 0.609 |
+| by expected-call count (1 / 2 / 3) | 0.752 / 0.608 / 0.698 |
+
+The loss is **broad, not one failure mode**: 19 scenarios lose only precision and 20 lose only
+recall, so there is no single fix. Most frequent spurious calls are `update_identity_doc` (10),
+`get_exchange_rate` (9), `search_products` (9) — plausible-but-unasked actions, the signature of
+an agent being too eager rather than confused about the tool set.
+
+**Leading hypothesis for the gap, and the next arm to run:** deviation 2 above — we send the
+benchmark's `VoiceAgent` instructions *alone*, and NVIDIA plausibly produced the card's numbers
+with their own `DEFAULT_SYSTEM_MESSAGE` prepended, which contains explicit restraint about when
+to call tools. `--system-message nvidia+benchmark` runs that arm; it is a full re-run, ~80 min on
+one GPU. Until it is run, the honest statement is: **Pass@1 reproduces, argument accuracy is not
+comparable because the judge differs, and Tool Selection is 9.4 points short for reasons internal
+to our setup.**
+
+Not yet measured: the latency section. `analyze_tool_latency.py` reports `total_samples: 0`
+without `user_speech_end_rel`, which needs `scripts/fdb_v3_asr_input.py` (Parakeet over
+`input.wav`) to run first.

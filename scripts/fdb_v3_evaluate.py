@@ -8,7 +8,7 @@ Two of the three published numbers need an LLM judge:
   * Tool Selection (82.5% on the model card) is pure set arithmetic over tool names.
     `evaluate_tool_calls.py::evaluate_tool_selection` calls nothing. This number is
     reproducible with no credentials at all -- run their script directly.
-  * Argument accuracy (42.2%) and Pass@1 (33%) route every argument comparison through
+  * Argument accuracy (44.2%) and Pass@1 (33%) route every argument comparison through
     `gpt-4o` ("semantic argument matching": "August 20" == "2026-08-20", "Vegas" ==
     "Las Vegas", +-5% numeric tolerance). Without `--use-llm` they silently fall back to
     `exact_match_args`, which would understate both by an unknown margin -- so running
@@ -195,16 +195,23 @@ def main() -> int:
         # Only meaningful with --asr-input inference: without user_speech_end_rel every
         # sample reports "unavailable" rather than a made-up zero.
         print("\n--- [3] analyze_tool_latency.py ---", flush=True)
-        _run("analyze_tool_latency",
-             [*common, "--output", str(out_dir / f"{args.provider}_latency_report.json")],
-             judge)
+        if args.no_llm:
+            # This script has no --use-llm switch: it instantiates OpenAI() at module scope
+            # unconditionally, so with no judge to patch in it dies on a missing key rather
+            # than degrading. Skipping is the honest outcome, not a workaround.
+            print("   SKIPPED: analyze_tool_latency.py builds an OpenAI client "
+                  "unconditionally, so it cannot run under --no-llm.", flush=True)
+        else:
+            _run("analyze_tool_latency",
+                 [*common, "--output", str(out_dir / f"{args.provider}_latency_report.json")],
+                 judge)
 
     if judge is not None:
         print(f"\njudge calls: {judge.calls} ({judge.failures} failed) via {judge.model}")
 
     # A one-screen comparison against the model card, so the answer to "did we reproduce
     # it" does not require opening three JSON files.
-    card = {"tool_selection_acc": 0.825, "argument_acc": 0.422, "pass_rate": 0.33}
+    card = {"tool_selection_acc": 0.825, "argument_acc": 0.442, "pass_rate": 0.33}
     report_path = out_dir / f"{args.provider}_evaluation_report.json"
     pass_path = out_dir / f"{args.provider}_pass_rate_report.json"
     if report_path.exists():
