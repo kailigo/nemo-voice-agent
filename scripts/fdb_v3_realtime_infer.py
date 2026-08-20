@@ -16,9 +16,17 @@ replay is kept only as a deliberate A/B, and this driver is the one that produce
 Faithfulness notes
 ------------------
 * The tool block is not ours. Tools go in flat (`{name, description, parameters}`) via
-  `session.update` and the *server* renders the function-calling prompt from its own
-  `/s2s/prompt_template.jinja`. Every prompt-format question this repo previously had to
-  reason about is thereby answered by the server, not by us.
+  `session.update` and the *server* renders the function-calling prompt.
+* **But the server does not render it from `/s2s/prompt_template.jinja` by default.**
+  `audio_server.py:53` gates that on `USE_JINJA_TEMPLATE_PROMPT`, which defaults to `"0"`; the
+  default branch (`:1179-1198`) appends `TOOLS_TEMPLATE` (`:68`) instead, whose leading
+  paragraphs are NVIDIA's tool-restraint text ("DO NOT use any tools when not needed, under no
+  circumstance", "If a required argument is missing, ask the user"). Those directly contradict
+  the benchmark's instructions ("Execute the tool unconditionally!", "DO NOT ASK CLARIFYING
+  QUESTIONS"), and the concatenation is invisible from the client -- the tell is `\n\n\n` in the
+  server's "Sending system prompt" log line. Run the server with `USE_JINJA_TEMPLATE_PROMPT=1`
+  for the instructions-only prompt the published table's other providers got, and use a distinct
+  `--provider` for each, because the two are different experiments.
 * Tool *execution* is still the benchmark's own `MockAPIRegistry` at the `instant` profile, and
   the executed/rejected distinction is `fdb_v3_nemo_infer.ToolExecutor`'s, unchanged: a call
   counts for F1 only if LiveKit's function tool would have run it.
@@ -308,8 +316,11 @@ async def run_example(args, example_dir: Path, metadata: dict, tools, registry) 
                                  "of the speech actually synthesised",
             "clock": "timestamps are input-audio-clock seconds (user audio streamed), and "
                      "audio is paced at realtime so they track wall clock",
-            "prompt": "system prompt = the FDB-v3 VoiceAgent instructions; the tool block is "
-                      "rendered server-side from /s2s/prompt_template.jinja",
+            "prompt": f"instructions sent = {args.system_message}; server prompt assembly = "
+                      f"{args.server_prompt_mode} (default appends audio_server.py:68 "
+                      f"TOOLS_TEMPLATE, whose restraint text contradicts the benchmark's "
+                      f"instructions; jinja does not)",
+            "server_prompt_mode": args.server_prompt_mode,
             "tool_call_logging": "actual_tool_calls holds only calls that would execute under "
                                  "LiveKit; see rejected_tool_calls",
             "tool_response_style": args.tool_response_style,
@@ -346,6 +357,13 @@ def main() -> int:
                    default="benchmark",
                    help="benchmark (default) = the FDB-v3 VoiceAgent instructions alone, what "
                         "every provider in the published table got.")
+    p.add_argument("--server-prompt-mode", choices=("default", "jinja", "unknown"),
+                   default="unknown",
+                   help="Recorded in every result file's notes. The client cannot detect this, "
+                        "and it changes the prompt materially: 'default' means the server "
+                        "appended NVIDIA's tool-restraint text, 'jinja' means it did not "
+                        "(USE_JINJA_TEMPLATE_PROMPT=1). Set it to match how the server was "
+                        "launched, or the result files misdescribe the experiment.")
     p.add_argument("--trailing-silence", type=float, default=20.0)
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num-shards", type=int, default=1)
@@ -390,7 +408,8 @@ def main() -> int:
           f"{f', {len(examples) - skipped - len(todo)} held back by --limit' if args.limit else ''})",
           flush=True)
     print(f"prompt: system_message={args.system_message} {len(args.instructions)} chars; "
-          f"{len(tools)} tools registered via session.update", flush=True)
+          f"{len(tools)} tools registered via session.update; "
+          f"server assembly={args.server_prompt_mode} (declared, not detected)", flush=True)
 
     failures = 0
     for i, example_dir in enumerate(todo, 1):

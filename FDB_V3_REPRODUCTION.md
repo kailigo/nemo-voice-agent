@@ -143,11 +143,42 @@ already streams one example end to end with tools registered.
 1. **No LiveKit.** The WAV is streamed to the container's `/v1/realtime` WebSocket at 24 kHz
    PCM16 in 80 ms chunks, paced at true realtime, which is what LiveKit would have done to a
    hosted realtime API. Tool schemas are registered flat (`{name, description, parameters}`)
-   via `session.update`, so the *server* renders the function-calling prompt from its own
-   `/s2s/prompt_template.jinja` — our earlier hand-rolled tool block is no longer in the loop.
-2. **The prompt is the benchmark's `VoiceAgent` instructions only.** NVIDIA plausibly used
-   their own persona text when producing the card's numbers; that is a separate arm, not the
-   default, because no other row in the published table saw it.
+   via `session.update`, so the *server* renders the function-calling prompt — our earlier
+   hand-rolled tool block is no longer in the loop.
+2. **The prompt is NOT the benchmark's `VoiceAgent` instructions alone — the server appends
+   NVIDIA's tool-restraint text.** This was discovered on 2026-08-20, after the run below, and
+   it invalidates the "instructions only" claim that stood here before.
+
+   `audio_server.py:53` gates prompt construction on `USE_JINJA_TEMPLATE_PROMPT`, which
+   **defaults to `"0"`**. Only the enabled branch uses `/s2s/prompt_template.jinja`. The default
+   branch (`:1179-1198`) does:
+
+   ```python
+   if instructions: prompt += instructions
+   ...
+   if prompt: prompt += "\n\n"
+   prompt += TOOLS_TEMPLATE.format(tools_content=clean_tools_json)
+   ```
+
+   and `TOOLS_TEMPLATE` (`audio_server.py:68`) opens with a newline followed by NVIDIA's
+   decision-process text. The server log confirms it: our instructions, then exactly `\n\n\n`,
+   then "When you receive a request, follow this decision process:", on 104 sessions — and zero
+   occurrences of the branch's "Preparing prompt using jinja template" log line.
+
+   So every session in the run below received two directly contradictory prompts concatenated:
+
+   | the benchmark's instructions say | the server appended |
+   | --- | --- |
+   | "Execute the tool unconditionally!" | "DO NOT use any tools when not needed, under no circumstance" |
+   | "DO NOT ASK CLARIFYING QUESTIONS" | "If a required argument is missing, ask the user; never guess" |
+
+   `USE_JINJA_TEMPLATE_PROMPT=1` gives the clean instructions-only prompt that the other
+   providers in the published table received; the jinja template carries no decision-process
+   text. That is the faithful arm and it is what `nemo_rt_jinja` measures.
+
+   Corollary: `--system-message nvidia+benchmark` is *not* the control arm it looks like. The
+   restraint text is already present by default, so that flag duplicates it rather than adding
+   it.
 3. **The judge is Claude Sonnet 4.5 via Bedrock, not gpt-4o.** We have no OpenAI key;
    Bedrock authenticates off the instance IAM role. The metric definition is unchanged and
    the prompts are the benchmark's own, but a stricter or looser judge moves argument
