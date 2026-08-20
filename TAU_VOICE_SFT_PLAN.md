@@ -783,6 +783,25 @@ responses are only what it *reads*. Scalars and non-JSON results keep the string
 more is needed, elide long variant/list bodies — but the agent must still pick the right variant,
 so that is genuinely lossy and must be measured against task success, not token count.
 
+**1b-bis. The `arguments` surface form matches the released model. VERIFIED 2026-08-20, no change
+needed.** Since 1b makes the tool-call surface form a *learned target*, it has to match what the
+released checkpoint already emits, or SFT spends its budget teaching the model to re-encode its own
+output format. There are two conventions in this codebase and the mismatch would be silent:
+
+| convention | surface form |
+| --- | --- |
+| object (what the release emits, measured on FDB-v3 `ecommerce_01`) | `<TOOLCALL>[{"name": "track_order", "arguments": {"order_id": "A-BC123"}}]</TOOLCALL>` |
+| escaped string | `<TOOLCALL>[{"name": "…", "arguments": "{\"order_id\": \"A-BC123\"}"}]</TOOLCALL>` |
+
+Nothing in the training path fixes this for us: `_normalize_toolcall_arguments`
+(`s2s_dataset.py:343`) converts string → object, but its flag `normalize_toolcall_arguments`
+defaults to `False` (`:397`, `:467`) and we do not set it. So data-prep decides, and it decides
+correctly: `tc["arguments"]` is a **`dict` in 71 of 71 tool calls across all 8 sim files with
+calls**, so `format_toolcall`'s `json.dumps` emits an object. Checked by type, not by eyeballing a
+sample — a single string-valued `arguments` anywhere in the corpus would teach the escaped form for
+those cuts only. No shards are built yet, so there is nothing to re-check downstream; re-run the
+type check if the tau2 tool-call schema ever changes.
+
 **1c. Raise `max_fc_total_tokens` to 12,000 and turn on `fc_log`. DONE and GPU-validated.**
 Measured on the repaired shards with augmentation on: **8,389 / 8,137 / 8,254** — all three over
 8,000, so the old value would now discard 100 % of the corrected data. 1b's saving does not close
