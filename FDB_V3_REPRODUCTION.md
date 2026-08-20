@@ -265,13 +265,21 @@ recall, so there is no single fix. Most frequent spurious calls are `update_iden
 `get_exchange_rate` (9), `search_products` (9) — plausible-but-unasked actions, the signature of
 an agent being too eager rather than confused about the tool set.
 
-**Leading hypothesis for the gap, and the next arm to run:** deviation 2 above — we send the
-benchmark's `VoiceAgent` instructions *alone*, and NVIDIA plausibly produced the card's numbers
-with their own `DEFAULT_SYSTEM_MESSAGE` prepended, which contains explicit restraint about when
-to call tools. `--system-message nvidia+benchmark` runs that arm; it is a full re-run, ~80 min on
-one GPU. Until it is run, the honest statement is: **Pass@1 reproduces, argument accuracy is not
-comparable because the judge differs, and Tool Selection is 9.4 points short for reasons internal
-to our setup.**
+**Leading hypothesis for the gap, and the next arm to run — restated 2026-08-20.** The original
+reading here was that we had sent the benchmark's `VoiceAgent` instructions *alone* and that
+prepending NVIDIA's restraint text via `--system-message nvidia+benchmark` was the missing arm.
+Deviation 2 above inverts that: **the restraint text was already there**, appended by the server on
+the default prompt branch, in all 100 sessions. Over-calling at 1.23x is therefore not explained by
+its absence — the model over-called *with* it present, while also being told "Execute the tool
+unconditionally!" by the benchmark. So the arm to run is the *other* direction: the clean
+instructions-only prompt, i.e. `USE_JINJA_TEMPLATE_PROMPT=1`, recorded under provider name
+`nemo_rt_jinja` so it cannot overwrite this run. Full re-run, ~80 min on one GPU, ~12 min across 8.
+`--system-message nvidia+benchmark` duplicates the restraint text rather than adding it and is not
+worth GPU time.
+
+Until `nemo_rt_jinja` is run, the honest statement is: **Pass@1 reproduces, argument accuracy is not
+comparable because the judge differs, and Tool Selection is 9.4 points short — measured on a
+prompt that carried two contradictory tool-use policies, so the number is not yet attributable.**
 
 Not yet measured: the latency section. `analyze_tool_latency.py` reports `total_samples: 0`
 without `user_speech_end_rel`, which needs `scripts/fdb_v3_asr_input.py` (Parakeet over
