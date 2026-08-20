@@ -17,17 +17,23 @@ This covers every way an allocation can end, not just the obvious one:
 Killing an inner *step* is fine and is not releasing the node: `squeue -s -j <jobid>` to list steps,
 then `scancel <jobid>.<step>`.
 
-**Also ask before requesting a new allocation.** Approval to run something is not approval to
-allocate for it. State the exact shape (nodes / time / partition) and wait for an answer.
-
-Reuse a live allocation instead of asking for a second one:
+**Getting a node needs no permission — but reuse before you allocate.** Check for a live allocation
+of ours first and use it if it isn't busy; only allocate a new one if there is none free. Don't ask
+either way, and don't stall on it.
 
 ```bash
-srun --overlap --jobid=<id> --nodes=1 --ntasks=1 ...
+squeue -u "$(whoami)" -o '%.8i %.20j %.8T %.10M %R'   # our live allocations
+squeue -s -j <jobid>                                  # steps running inside one -> is it busy?
+srun --overlap --jobid=<jobid> --nodes=1 --ntasks=1 nvidia-smi   # are the GPUs actually free?
 ```
 
-When a job *is* already gone, say so plainly with the `sacct` evidence and present the options —
-don't quietly re-allocate.
+"Occupied" means something of ours is really using it — running steps, or GPUs with memory in use.
+An idle allocation is the thing to grab. Reuse it with `srun --overlap --jobid=<id> ...` rather than
+requesting a second node.
+
+If nothing is free, allocate (same shape as before: 1 node, `ml.p5en.48xlarge`, `--no-shell`). Note
+that the queue is often saturated, so a request may pend for a long time — report that rather than
+waiting silently.
 
 ## Ask before `git push`
 
