@@ -217,7 +217,60 @@ Do not re-open these without new evidence.
 
 ## 5. The control: are these episodes winnable?
 
-`gemini_baseline_0821b`, in flight. Head to head on the **4 episodes both arms have now
+### 5.0 Is the control's absolute level believable?
+
+Checked against the τ-Voice paper (arXiv 2603.13686, Sierra.ai + Princeton) before using the
+control for anything, because 1 real pass in 8 *looks* too low to be a valid reference.
+It is not. Table 6 pass@1:
+
+| provider | All Clean | All Realistic | retail Clean | airline Clean |
+|---|---|---|---|---|
+| **Google** `gemini-live-2.5-flash-native-audio` | **31%** | 26% | 45% | 28% |
+| OpenAI `gpt-realtime-1.5` | 49% | 35% | — | — |
+| xAI `grok-voice-agent` | 51% | 38% | — | — |
+
+Google is the **lowest** of the three providers in the paper. Our control at n=8 scores
+**3/8 reward > 0 = 37.5%** (avg reward 0.375; retail 3/5, airline 0/3), i.e. above the
+published 31%, at a sample size whose 95% CI is roughly ±34 points. Nothing to explain.
+
+The public leaderboard's much higher figures are **newer models, not this one**: Sierra's
+blog puts xAI `grok-voice-think-fast-1.0` (Apr 2026) at 67% and states voice has gone from
+"roughly 45% of text capability when the paper was written, to ~79% today". No Gemini voice
+number is published there. Do not compare our Dec-2025-era Gemini Live against it.
+
+Note also that the paper's pass@1 **is** the DB/COMMUNICATE reward whose vacuous-pass
+artifact §2.1 documents, so the published numbers carry that artifact too.
+
+Config audit vs the paper. Matched exactly: 200 ms tick, 1200 s conversation cap, ElevenLabs
+TTS, fixed seed per task, and `--speech-complexity control` — verified equal to the paper's
+"Clean" condition at `user_simulation_voice_presets.py:96`, whose `CONTROL_CONFIG` is
+American personas, no background/burst noise, `frame_drop_rate 0.0`, no muffling, no vocal
+tics, `telephony_enabled: True` (G.711 µ-law 8 kHz). (`regular` is the paper's *Realistic*
+column and is what `prepare_submission.py:496` requires for leaderboard submission — a
+different measurement, not a fix.) Remaining deviations, by likely impact:
+
+1. Model `gemini-3.1-flash-live-preview` (the repo default) vs the paper's
+   `gemini-live-2.5-flash-native-audio`, still present as `_LEGACY_GEMINI_MODEL`
+   (`config.py:192`). 3.1 lacks proactive audio, input-audio transcription and context
+   compression. Sign unknown.
+2. User simulator `bedrock/…sonnet-4-5` vs the paper's `gpt-4.1`. No OpenAI key here.
+   Symmetric across arms; a stronger simulator is plausibly a *harder* customer.
+3. Stock ElevenLabs voices vs the 7 Sierra persona ids, which 404 on our key. This changes
+   exactly the acoustics the ASR front-end sees, so it is the deviation most likely to
+   matter for modes A and E specifically.
+4. `--hallucination-retries 0` vs the CLI default 3 (`cli.py:444`). Matched across arms
+   (`tau2_stage2_subset.sh:180`), so not a confound; mildly pessimistic for both.
+5. n=8 on a subset chosen for arm A, not a random sample.
+
+**Decision: not re-running the control on 2.5-native-audio.** Its job is to answer "were
+these episodes winnable by some voice agent", and 37.5% vs arm A's 0 answers that with room
+to spare. Re-running would move an absolute level that already agrees with publication and
+would not touch any mode A/B receipt below, since those are per-episode tool-call
+comparisons rather than aggregate rates.
+
+### 5.1 Head to head
+
+`gemini_baseline_0821b`, in flight. On the **4 episodes both arms have now
 run**, which is the only comparison the numbers support so far:
 
 | episode | arm A (NeMo 11B) | arm B (Gemini Live) |
@@ -328,3 +381,10 @@ overwrites the arm you were going to compare against.
   A's 0 and 0/4. Confirms modes A and B are model defects, and that Gemini shares mode A at
   much lower amplitude but not mode G — which is what makes arm A's version fatal. Mode D
   and the encoder-vs-LLM question (§7) are open.
+* **2026-08-21, later** — §5.0 added. The control's absolute level was audited against the
+  τ-Voice paper because it looked too low to be a valid reference: it is not. Google's
+  published Clean pass@1 is 31% All / 45% retail / 28% airline, the lowest of the three
+  providers, and our control is at 37.5% (3/8) — above it. The public leaderboard's higher
+  numbers belong to newer thinking-voice models (xAI at 67%), not to Gemini Live. Config
+  audit recorded; `control` verified equal to the paper's "Clean". Decision: do not re-run
+  the control on `gemini-live-2.5-flash-native-audio`.
