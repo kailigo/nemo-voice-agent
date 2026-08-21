@@ -516,7 +516,67 @@ system that fires tool names readily and gets their arguments wrong, and **our 7
 the signature of a more cautious one. Both rows are consistent with the same weights behind different
 orchestration, which is the most that released artifacts can establish. Two of the card's three
 metrics reproduce, the third is characterised down to its mechanism, and the numbers are accepted as
-measured.
+measured. The all-100 numbers below supersede the `71.7 % / 50.7 %` pair quoted here, which was the
+hard-30 slice scored with our own argument convention.
+
+### The all-100 close, 2026-08-21 — we bracket the card rather than match it
+
+The research arm was finished over the remaining 70 easy+medium scenarios and merged into one
+provider with `scripts/fdb_v3_merge_arm.py` (the evaluators glob `*/result_<provider>.json`, so the
+arm *is* the filename; merging rewrites the `provider` field to agree, refuses to clobber, and checks
+final coverage, because a partial arm scores *higher* while measuring less). Running the benchmark's
+own `evaluate_tool_calls.py` on all three arms at 100 examples:
+
+| arm, all 100 | Tool Selection | turn-taken | Argument acc, exact-match |
+| --- | --- | --- | --- |
+| `nemo_research` | **78.3 %** | 99/100 | 22.2 % |
+| `nemo_rt` | 73.1 % | 98/100 | 36.7 % |
+| `nemo_rt_jinja` | 70.8 % | 100/100 | 32.8 % |
+| card | **82.5 %** | — | **44.2 %** |
+
+Tool Selection lands **4.2 points short**, and the residual is fully accounted for: 40 never-expected
+calls (27 of them *cross-domain*) plus 7 exact duplicates. Deleting those while leaving recall
+untouched scores **82.1 %**, within 0.4 of the card. It is a precision deficit, not a recall deficit.
+
+**The argument row was not comparable, and that mattered.** The card's 44.2 % came from `--use-llm`,
+whose judge is told to forgive `$RESULT` references, date formats, aliases, ±5 % numerics and
+underscore-vs-space; `exact_match_args` forgives none of it. So 22.2 % / 36.7 % / 32.8 % are a strict
+lower bound on the same behaviour, not a deficit. `scripts/fdb_v3_judge_args.py` supplies the
+comparable number — 209 distinct verdicts (345 before dedup), two judge families, per-verdict audit
+logs under `logs/fdb_v3_judge/`:
+
+| arm | exact-match | judge: Sonnet 4.5 | judge: gpt-oss-120b |
+| --- | --- | --- | --- |
+| `nemo_research` | 22.2 % | 30.8 % | 26.1 % |
+| `nemo_rt` | 36.7 % | **51.7 %** | **47.3 %** |
+| `nemo_rt_jinja` | 32.8 % | 48.2 % | 43.7 %–44.7 % |
+| card | — | **44.2 %** | **44.2 %** |
+
+**On both judges the container path meets or beats the card on arguments (47.3–51.7 % vs 44.2 %)
+while sitting 9.4 points below it on names, and the research path is closer on names but far below on
+arguments.** The card's operating point lies *between* our two arms, on the same eagerness/caution
+axis §4 identified. That is a stronger and more useful result than a match would have been: it says
+the released weights can be driven to either side of the card's numbers by orchestration alone.
+
+Three caveats, all recorded rather than smoothed over:
+
+* **The card's judge is unreproducible here.** It is `gpt-4o`; there is no OpenAI key on this cluster
+  and Bedrock's catalogue has no gpt-4o. These are our judges applying the card's rubric verbatim
+  (`assert_rubric_unchanged()` fails loudly if the upstream rubric drifts from the copy in the
+  script), not the card's number.
+* **The judges disagree by up to 4.7 points**, so quote a range and name the judge. gpt-oss is
+  systematically stricter (rejections −6/−5/−7 against Sonnet's −3/−0/−2), and the audit shows why:
+  both reject calls carrying *extra* fabricated arguments — a `passenger_name: "user_1234"` on an
+  `add_to_cart`, a hallucinated `max_price: 1000` on `search_apartments` — which `exact_match_args`
+  forgives by construction, since it only iterates the expected keys. The rubric is silent on extras,
+  so that strictness is judge-invented; it is defensible, and it is not the card's convention.
+* **One verdict was unobtainable** — Bedrock returns an empty completion for a passport-number
+  comparison, evidently a content filter. It is reported as an interval (both substitutions scored)
+  rather than dropped. This matters because `llm_judge_argument` wraps its call *and* its parse in a
+  bare `except Exception: return exact_match_args(...)`: under plain `--use-llm` a filtered response,
+  a throttle or a truncated body silently becomes an exact-match verdict and the run reports ~22 %
+  looking like it judged. The script counts judged / unparseable / api-failed separately and
+  suppresses the number outright above a 5 % miss rate.
 
 ## 5. Latency, measured 2026-08-21
 
