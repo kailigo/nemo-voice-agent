@@ -223,9 +223,11 @@ then `scripts/fdb_v3_evaluate.py --provider nemo_rt` with the Bedrock judge (274
 failures).
 
 Coverage: **99 completed, 1 `inference_error`**, 2 silent. The failure is
-`ecommerce_20_66c4f3cb14cbfc4db836bd4e`, and it is **deterministic, not a race** — three
-attempts (`scripts/fdb_v3_retry_failures.sh`, 2 rounds) all died the same way, so the earlier
-"race" reading was wrong for this example. The mechanism is the released Triton backend's
+`ecommerce_20_66c4f3cb14cbfc4db836bd4e`, and it is **deterministic on this prompt branch, not a
+race** — three attempts (`scripts/fdb_v3_retry_failures.sh`, 2 rounds) all died the same way, so
+the earlier "race" reading was wrong for this example. It is not a fixed property of the example
+either: the same audio completed cleanly on the jinja branch (§4), so the crash path is
+prompt-dependent. The mechanism is the released Triton backend's
 degenerate-tool-call recovery: the model opens a tool call and never emits the end-of-tool-call
 token → `Fast extract: exceeded 512 steps without eotc_id` → the vLLM request meanwhile hits
 EOS → `append_request: request '…' not found` → HTTP 500 → WebSocket 1011. It is left in place
@@ -269,21 +271,60 @@ recall, so there is no single fix. Most frequent spurious calls are `update_iden
 `get_exchange_rate` (9), `search_products` (9) — plausible-but-unasked actions, the signature of
 an agent being too eager rather than confused about the tool set.
 
-**Leading hypothesis for the gap, and the next arm to run — restated 2026-08-20.** The original
-reading here was that we had sent the benchmark's `VoiceAgent` instructions *alone* and that
-prepending NVIDIA's restraint text via `--system-message nvidia+benchmark` was the missing arm.
-Deviation 2 above inverts that: **the restraint text was already there**, appended by the server on
-the default prompt branch, in all 100 sessions. Over-calling at 1.23x is therefore not explained by
-its absence — the model over-called *with* it present, while also being told "Execute the tool
-unconditionally!" by the benchmark. So the arm to run is the *other* direction: the clean
-instructions-only prompt, i.e. `USE_JINJA_TEMPLATE_PROMPT=1`, recorded under provider name
-`nemo_rt_jinja` so it cannot overwrite this run. Full re-run, ~80 min on one GPU, ~12 min across 8.
-`--system-message nvidia+benchmark` duplicates the restraint text rather than adding it and is not
-worth GPU time.
+### The faithful-prompt arm, `nemo_rt_jinja`, 2026-08-21 — the prompt was not the cause
 
-Until `nemo_rt_jinja` is run, the honest statement is: **Pass@1 reproduces, argument accuracy is not
-comparable because the judge differs, and Tool Selection is 9.4 points short — measured on a
-prompt that carried two contradictory tool-use policies, so the number is not yet attributable.**
+The hypothesis that stood here until 2026-08-21 was that the 9.4-pt Tool Selection gap came from the
+prompt: deviation 2 showed all 100 sessions carried NVIDIA's restraint text appended after the
+benchmark's contradictory "Execute the tool unconditionally!", which no other provider in the card's
+table received. `USE_JINJA_TEMPLATE_PROMPT=1` removes it. That arm has now been run —
+100 examples, provider `nemo_rt_jinja`, branch verified from the server log (`Preparing prompt using
+jinja template` ×100, `Call a tool ONLY when the user` ×0).
+
+**It did not close the gap. It moved every metric slightly the wrong way.** Comparing at n=100,
+which is the only fair comparison because the jinja arm has no silent episodes:
+
+| metric | `nemo_rt` (restraint text) | `nemo_rt_jinja` (clean) | card | judge? |
+| --- | --- | --- | --- | --- |
+| Tool Selection | 71.7 % | **70.8 %** | 82.5 % | no |
+| Argument accuracy | 50.7 % | 48.2 % | 44.2 % | yes |
+| Pass@1 | 35.0 % | 31.0 % | 33.0 % | yes |
+
+The mechanism is worth more than the headline. Removing the restraint text **did** make the model
+less eager — 184 calls → 162, i.e. 1.23x → **1.08x** of the 150 expected — and yet:
+
+| | `nemo_rt` | `nemo_rt_jinja` |
+| --- | --- | --- |
+| mean recall | 0.778 | **0.765** |
+| mean precision | 0.856 | 0.853 |
+| call-count shape (right / over / under) | 52 / 27 / 21 | 49 / **29** / 22 |
+| losing precision only / recall only / both | 19 / 21 / 8 | 23 / 22 / 8 |
+| by difficulty (easy / medium / hard) | 0.758 / 0.770 / 0.609 | 0.732 / 0.770 / **0.609** |
+
+**Precision did not improve despite 22 fewer calls, and recall fell.** So the calls the clean prompt
+suppressed were disproportionately *correct* ones. Note the count of scenarios that over-call went
+*up*, 27 → 29, while the total number of calls went down: fewer calls, spread worse. Hard scenarios
+are identical to three decimal places (0.609) and medium is unchanged (0.770); the whole delta is on
+easy (0.758 → 0.732).
+
+So the restraint text was mildly *helping*, or at worst neutral — the third of the three outcomes
+this arm was set up to distinguish, and the one that says something about the card rather than about
+us. **The Tool Selection gap is real, judge-free, and internal to our setup. It is not a launch-flag
+artifact.** `--system-message nvidia+benchmark` remains not worth GPU time: it duplicates text that
+is already present by default and that we now know does not drive the gap.
+
+The honest statement, updated: **Pass@1 reproduces on the default branch (35.0 % vs 33.0 %) and
+falls below on the clean one (31.0 %); argument accuracy is not comparable in either arm because the
+judge differs; and Tool Selection is 9.4–11.7 points short on both prompt branches, which rules out
+the prompt as the explanation.** What remains untested is the harness itself — tool-call extraction,
+the `instant` latency profile, and the trailing-silence convention — plus the possibility that the
+card's number was produced with a checkpoint or decode configuration the released container does not
+reproduce.
+
+One incidental finding: `ecommerce_20_66c4f3cb14cbfc4db836bd4e`, described above as a
+**deterministic** backend failure that survived three retries, **completed cleanly on the jinja
+branch** with three sensible calls. So that crash is prompt-dependent, not a fixed property of the
+released Triton backend. The jinja arm also has zero silent episodes, against two on the default
+branch.
 
 ## 5. Latency, measured 2026-08-21
 
@@ -291,14 +332,17 @@ prompt that carried two contradictory tool-use policies, so the number is not ye
 `user_speech_end_rel`, so `analyze_tool_latency.py` runs for the first time. Re-scoring changed no
 headline metric — nothing in §4 reads that field.
 
-`logs/fdb_v3/nemo_rt_latency_report.json`:
+`logs/fdb_v3/nemo_rt_latency_report.json` and `…_nemo_rt_jinja_latency_report.json`. Note the N
+column: it is the count *surviving* the interruption filter, so it differs per arm and the two
+columns are not the same sample.
 
-| | N | mean | median | min / max |
-| --- | --- | --- | --- | --- |
-| First response | 63 | 4.05 s ± 3.22 | 3.04 s | 0.32 / 15.44 s |
-| Tool call | 51 | 1.46 s ± 1.93 | 1.12 s | −1.76 / 11.12 s |
-| Task completion | 63 | 4.82 s ± 5.45 | 3.20 s | 0.32 / 35.36 s |
-| Filler usage | 3/63 (5 %) | | | |
+| | `nemo_rt` N | mean | median | `nemo_rt_jinja` N | mean | median |
+| --- | --- | --- | --- | --- | --- | --- |
+| First response | 63 | 4.05 s ± 3.22 | 3.04 s | 69 | 3.97 s ± 4.16 | 2.80 s |
+| Tool call | 51 | 1.46 s ± 1.93 | 1.12 s | 55 | 1.77 s ± 3.47 | 1.20 s |
+| Task completion | 63 | 4.82 s ± 5.45 | 3.20 s | 69 | 4.18 s ± 4.39 | 2.80 s |
+| Filler usage | 3/63 (5 %) | | | 5/69 (7 %) | | |
+| dropped as interruptions | 35/98 (36 %) | | | 31/100 (31 %) | | |
 
 **Neither this 4.05 s nor the 0.64 s quoted in §1 is comparable to the card's 448 ms**, and the
 reason is the anchor, not the model:
@@ -335,10 +379,45 @@ So the honest latency claim is: **once the server decides the user has stopped, 
 median 0.64 s — but on 35 of 98 examples (36 %) it decides that mid-turn and talks over the user.**
 
 **Open hypothesis.** That 36 % barge-in rate and the 1.23x over-calling in §4 may be one behaviour —
-an agent acting before the user has finished asking. Testing it is cheap: re-run this analysis on
-`nemo_rt_jinja` and see whether the barge-in rate moves together with the call count. Until then it
-is a hypothesis, not a mechanism.
+an agent acting before the user has finished asking. **Tested below**: both moved together on the
+clean prompt and accuracy did not follow, so they may share a cause but the cause is not one that
+accuracy is downstream of.
 
 Caveat, per arm: the container's agent channel *is* audio, so `asr_chunks` timestamps are real
 speech onsets and the analysis is sound. On a research-path arm the same field holds first-*token*
 times, which are not comparable to any of the above.
+
+### Signed per-turn latency — `scripts/fdb_v3_signed_latency.py`
+
+Both figures above have a defect: FDB's drops every negative sample, and ours measures from an anchor
+the model chose for itself. So this script keeps the sign and measures **every** user turn, pairing
+each of the server's end-of-speech markers with the response that follows it and scoring it against
+the turn's *acoustic* end. Nothing is discarded; the barge-in rate becomes a reported number instead
+of a filter. **Not comparable to any published column** — no published column is computed this way.
+
+| | `nemo_rt` | `nemo_rt_jinja` |
+| --- | --- | --- |
+| acoustic user turns | 117 | 117 |
+| turns answered / unanswered | 100 / 17 | 101 / 16 |
+| agent responses | 135 | 136 |
+| turns cut into >1 response | 32 | 27 |
+| unprompted openings (in n examples) | 28 (17) | 29 (17) |
+| signed median / mean | +2.64 s / +1.89 s | +2.72 s / +1.92 s |
+| **barge-in rate** (turns / examples) | 25.2 % / 29.6 % | **22.8 % / 23.0 %** |
+| barge-in median depth | −5.28 s | −5.36 s |
+| clean-response median | +3.12 s | +3.28 s |
+
+Two things this exposes that neither earlier metric could:
+
+* **The server over-segments.** 135 responses against 117 acoustic turns, with 32 turns cut into
+  more than one response. That is the mechanism behind the barge-ins: end-of-speech fires at
+  intra-turn pauses, so one user turn draws several replies.
+* **The agent opens unprompted in 17 of 100 episodes** — a greeting at ~2 s before the user has
+  finished, or said anything. This is also the trap in the obvious implementation of this metric:
+  pairing each turn with "the first onset after it began" scores that greeting as a 26-second
+  barge-in. `pair_onsets` documents the case (`housing_24_69a9cf80f4d7668d5c815038`).
+
+**On the barge-in ↔ over-calling hypothesis:** both eagerness measures did fall together on the
+clean prompt — barge-in 29.6 % → 23.0 % of examples, over-calling 1.23x → 1.08x — but Tool Selection
+did *not* improve (71.7 % → 70.8 %). So the two behaviours plausibly share a cause, and reducing
+them does not by itself buy accuracy. Do not write this up as "less eager, therefore better".

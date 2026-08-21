@@ -375,8 +375,10 @@ Status board at 08:10:
 | step | state | where |
 | --- | --- | --- |
 | A1 serve on jinja branch | **done, GATE PASSED** | `logs/fdb_v3/serve_jinja.log` |
-| A2 `nemo_rt_jinja` arm | **running, 30/100** | `logs/fdb_v3/infer_nemo_rt_jinja.log` |
-| A3 score the new arm | blocked on A2 | — |
+| A2 `nemo_rt_jinja` arm | **done, 100/100, 0 failures** | `logs/fdb_v3/infer_nemo_rt_jinja.log` |
+| A3 score the new arm | **done — hypothesis FALSIFIED** | `logs/fdb_v3/eval_nemo_rt_jinja.log` |
+| B1b ASR pass, jinja arm | **done, 100/100** | `logs/fdb_v3/asr_nemo_rt_jinja.log` |
+| signed per-turn latency | **done** | `scripts/fdb_v3_signed_latency.py` |
 | A4 live `nemo_rt` check | script written, not yet run | `tau-voice-2/scripts/nemo_rt_live_check.py` |
 | A5 concurrency probe | blocked on A2 | — |
 | B1 Parakeet ASR pass | **done, 100/100, 0 failures** | `logs/fdb_v3/asr_nemo_rt.log` |
@@ -402,7 +404,7 @@ So `USE_JINJA_TEMPLATE_PROMPT=1` took effect and **no restraint text reached the
 opposite of the 100-session default-branch run in `FDB_V3_REPRODUCTION.md` §3 deviation 2. This is
 the first faithful-prompt arm.
 
-### A2 — running, and slower than planned
+### A2 — done, 100/100, and slower than planned
 
 Clean so far: every example `status=completed`, `rtf` 1.002–1.007, no server errors, no rejects.
 Per-turn latency in the log is 0.48–0.8 s, matching the default-branch arm.
@@ -417,6 +419,94 @@ The model is over-calling on the jinja branch too — e.g. `ecommerce_13`: expec
 'update_identity_doc']`. **Not a result yet** — n=30, and `update_identity_doc` was already the most
 frequent spurious call on the default branch (10 occurrences). Worth noting only because it is the
 early signal for A3's second outcome ("doesn't move"). Wait for the score.
+
+Final: 100/100 `status=completed`, 0 errors, 0 silent episodes, `rtf` 1.00–1.01 throughout. Branch
+proof re-checked at the end — jinja ×100, restraint text ×0. Wall clock ~2 h 50 m.
+
+### A3 — the answer, and it is outcome 3: **the prompt was not the cause**
+
+The night existed to test one hypothesis: *Tool Selection is 9.4 pts short of the card because our
+prompt carried two contradictory tool-use policies.* Removing the contradiction did not close the
+gap. It made every metric slightly worse.
+
+| metric, n=100 | `nemo_rt` (default branch) | `nemo_rt_jinja` (faithful) | card |
+| --- | --- | --- | --- |
+| **Tool Selection** (judge-free) | 71.7 % | **70.8 %** | **82.5 %** |
+| Argument accuracy (judge differs) | 50.7 % | 48.2 % | 44.2 % |
+| Pass@1 | 35.0 % | **31.0 %** | 33.0 % |
+| Response quality (judge) | 0.480 | 0.390 | — |
+| turn-take rate | 98/100 | **100/100** | — |
+
+So: **write down outcome 2-and-a-bit.** The gap is real, judge-free, and internal to our setup; it
+is not a launch-flag artifact. It is not cleanly outcome 3 either — the restraint text was worth
+~1 pt of Tool Selection and ~4 pts of Pass@1, which is not "the card relies on restraint the
+benchmark doesn't supply", it is noise-adjacent on n=100. The honest claim is that **the prompt
+branch is not where the missing 11 points live**, and the next hypothesis has to come from
+somewhere else.
+
+The mechanism, which is the useful part. Removing the restraint text did exactly what it should to
+call volume, and that bought nothing:
+
+| | `nemo_rt` | `nemo_rt_jinja` |
+| --- | --- | --- |
+| tool calls emitted vs expected | 184 (**1.23x**) | 162 (**1.08x**) |
+| recall over tool names | 0.778 | **0.765** |
+| precision over tool names | 0.856 | **0.853** |
+| episodes right / over / under-calling | 52 / 27 / 21 | 49 / **29** / 22 |
+
+Over-calling fell by 22 calls and precision *did not move* (0.856 → 0.853) while recall *fell*
+(0.778 → 0.765). That is only possible if the calls the restraint text was suppressing were
+disproportionately **correct** ones. The model is not over-calling because something told it to; it
+is over-calling because it cannot tell which tool the turn needs, and a broader net catches more
+right answers along with the wrong ones.
+
+Where the delta sits, by cut: `hard` is **identical** (0.609 both arms), `medium` is **identical**
+(0.770 both arms), and the entire Tool Selection difference is on `easy` (0.758 → 0.732). Pass@1
+degrades most on multi-tool episodes (2 tools: 0.111 → 0.056; 3 tools: 0.0 → 0.0). Nothing in the
+prompt change touched the hard cases at all.
+
+Two incidental findings worth keeping:
+
+* **`ecommerce_20_66c4f3cb14cbfc4db836bd4e` completed cleanly on the jinja branch.** It was
+  documented as a *deterministic* Triton backend failure (`Fast extract: exceeded 512 steps without
+  eotc_id` → `append_request: request not found` → HTTP 500 → WS 1011) surviving three retries. It
+  produced three sensible calls this time. So that crash is **prompt-dependent**, not a fixed
+  property of the example — the degenerate-tool-call path is reachable from the restraint prompt and
+  not from the clean one. Correct §3 of `FDB_V3_REPRODUCTION.md` if it still calls it deterministic.
+* Silent episodes went 2 → 0, so `*_all` and turn-taken metrics coincide on the jinja arm. That is
+  the one unambiguous improvement.
+
+### Signed per-turn latency — the metric Kai approved
+
+`scripts/fdb_v3_signed_latency.py`, run over both arms. Purpose: FDB's own metric drops every
+negative latency as an "interruption", which discards 35 of 98 examples on `nemo_rt` — and those are
+exactly the fastest responses, so the surviving mean is biased slow by construction.
+
+| | `nemo_rt` | `nemo_rt_jinja` |
+| --- | --- | --- |
+| acoustic user turns | 117 | 117 |
+| turns answered / unanswered | 100 / 17 | 101 / 16 |
+| **agent responses** | **135** | **136** |
+| turns cut into >1 response | 32 | 27 |
+| unprompted openings (examples) | 28 (17) | 29 (17) |
+| signed median | **+2.64 s** | +2.72 s |
+| **barge-in rate** (turns / examples) | 25.2 % / 29.6 % | **22.8 % / 23.0 %** |
+| barge-in median depth | −5.28 s | −5.36 s |
+| clean-response median | +3.12 s | +3.28 s |
+
+Two structural findings that no published column shows:
+
+1. **The server over-segments.** 135 responses against 117 acoustic turns; 32 turns get cut into
+   more than one response. This is the mechanism behind the barge-ins — the end-of-speech detector
+   fires at intra-turn pauses, and the model answers each fragment.
+2. **17 of 100 episodes open unprompted**, with a greeting at ~2 s before the user has said
+   anything. Any pairing rule keyed on "first agent onset after the turn started" scores that
+   greeting as a 26-second barge-in; this script pairs through the server's own end-of-speech
+   markers instead, which is why its numbers are trustworthy and the first draft's were not.
+
+**Do not write this up as "less eager, therefore better."** Both eagerness measures fell together
+(barge-in 29.6 → 23.0 % of examples, over-calling 1.23x → 1.08x) and Tool Selection did *not*
+improve. They plausibly share a cause; reducing them does not buy accuracy.
 
 ### B1 + B2 — the latency section exists for the first time, and it needs two numbers
 
