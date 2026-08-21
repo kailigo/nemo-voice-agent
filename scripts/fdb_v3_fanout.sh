@@ -23,6 +23,10 @@ JOBID="${1:?usage: $0 <jobid> [extra args...]}"; shift
 ENV_PREFIX=/fsx/home/kai.li/miniforge3/envs/voicechat
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NGPU="${NGPU:-8}"
+# Shard k runs on GPU (GPU_OFFSET + k). Needed when the VoiceChat NIM container already owns
+# GPU 0 (fdb_v3_serve.sh pins CUDA_VISIBLE_DEVICES=0): NGPU=7 GPU_OFFSET=1 uses GPUs 1-7 and
+# leaves the server untouched. Shard indices stay 0..NGPU-1 so the split is independent of it.
+GPU_OFFSET="${GPU_OFFSET:-0}"
 BASE_PORT="${BASE_PORT:-29700}"
 RUN_NAME="${RUN_NAME:-fdb_v3}"
 LOGDIR="${LOGDIR:-$HERE/../logs/$RUN_NAME}"
@@ -43,13 +47,13 @@ for gpu in $(seq 0 $((NGPU - 1))); do
   # one node otherwise die with EADDRINUSE -- which reads like a networking fault.
   srun --jobid="$JOBID" --overlap bash -c "
     export LD_LIBRARY_PATH='$ENV_PREFIX/lib:\${LD_LIBRARY_PATH:-}'
-    export CUDA_VISIBLE_DEVICES='$gpu'
+    export CUDA_VISIBLE_DEVICES=$((GPU_OFFSET + gpu))
     export MASTER_PORT=\$(($BASE_PORT + $gpu))
     exec '$ENV_PREFIX/bin/python' -u '$HERE/fdb_v3_nemo_infer.py' \
       --shard $gpu --num-shards $NGPU $(printf '%q ' "$@")
   " >"$log" 2>&1 &
   pids+=($!)
-  note "shard $gpu -> gpu $gpu, log $log"
+  note "shard $gpu -> gpu $((GPU_OFFSET + gpu)), log $log"
 done
 
 rc_total=0

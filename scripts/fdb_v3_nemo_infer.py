@@ -360,6 +360,13 @@ def main() -> int:
                    help="LM positions reserved for function tokens. Adds to the "
                         "preallocated horizon, which inference is O(T^2) in, so the model "
                         "default of 12000 is a large and pointless cost for <=3 calls.")
+    p.add_argument("--difficulty", action="append", default=None,
+                   choices=("easy", "medium", "hard"),
+                   help="Restrict to these difficulty buckets (repeatable). Filtered BEFORE "
+                        "sharding so the split stays balanced over the subset. The whole "
+                        "residual Tool Selection gap lives in `hard` "
+                        "(FDB_V3_REPRODUCTION.md, the discrepancy audit), so `--difficulty "
+                        "hard` is 30 examples that carry all of the signal.")
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--limit", type=int, default=0, help="Stop after N examples (debugging).")
@@ -391,6 +398,13 @@ def main() -> int:
         system_message = f"{nvidia_default_system_message()}\n\n{system_message}"
 
     examples = discover(args.data_dir)
+    if args.difficulty:
+        wanted = set(args.difficulty)
+        kept = [d for d in examples
+                if json.loads((d / "metadata.json").read_text())["difficulty"] in wanted]
+        print(f"difficulty filter {sorted(wanted)}: {len(kept)} of {len(examples)} examples",
+              flush=True)
+        examples = kept
     if args.num_shards > 1:
         examples = examples[args.shard::args.num_shards]
     todo = [d for d in examples if args.force or not (d / f"result_{args.provider}.json").exists()]
