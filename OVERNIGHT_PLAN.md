@@ -379,8 +379,9 @@ Status board at 08:10:
 | A3 score the new arm | **done — hypothesis FALSIFIED** | `logs/fdb_v3/eval_nemo_rt_jinja.log` |
 | B1b ASR pass, jinja arm | **done, 100/100** | `logs/fdb_v3/asr_nemo_rt_jinja.log` |
 | signed per-turn latency | **done** | `scripts/fdb_v3_signed_latency.py` |
-| A4 live `nemo_rt` check | script written, not yet run | `tau-voice-2/scripts/nemo_rt_live_check.py` |
-| A5 concurrency probe | blocked on A2 | — |
+| A4 live `nemo_rt` check | **done — works on mock, blocked on retail** | `tau-voice-2/logs/nemo_rt_live_check_*.json` |
+| A4b prompt-budget sweep | **done, 15 domains** | `tau-voice-2/logs/nemo_rt_prompt_budget.json` |
+| A5 concurrency probe | not started | — |
 | B1 Parakeet ASR pass | **done, 100/100, 0 failures** | `logs/fdb_v3/asr_nemo_rt.log` |
 | B2 re-score with latency | **done** | `logs/fdb_v3/eval_nemo_rt_withlatency.log` |
 | B3 bare-vs-protocol A/B | not started | — |
@@ -596,7 +597,7 @@ was discovered. `--server-prompt-mode` (added for A2) stamps the branch explicit
 reader trusting that note would mislabel the arm. Do not fix by editing the files in place —
 provenance is better served by this note than by a rewrite.
 
-### A4 — script written, not yet run
+### A4 — run live: the provider works, and it found a 6144-token wall
 
 `tau-voice-2/scripts/nemo_rt_live_check.py` exists and parses. It drives
 `DiscreteTimeNemotronRTAdapter` directly from the user channel of a recorded stereo `both.wav`
@@ -604,9 +605,41 @@ provenance is better served by this note than by a rewrite.
 **zero ElevenLabs characters**. It reports the four falsifiable claims from §2 A4 as explicit
 PASS/FAIL lines plus `chunks_dropped`, and writes `logs/nemo_rt_live_check_<domain>.json`.
 
-Deliberately **not** run yet: it would open a second concurrent session against the server while A2
-is mid-arm, and §2 A5 rules that out — a contended server would silently degrade the deliverable.
-It runs after A2 completes, `--domain mock` first, then `retail`.
+It was deliberately held until A2 finished — a second concurrent session would have silently
+degraded the deliverable — then run `--domain mock` first, then `retail`.
+
+**`mock`: 5 of 6 checks PASS.** 340 ticks, 68 s of audio in 70.4 s wall (1.036), `chunks_dropped=0`,
+425 Triton inferences, arguments all decoded to dict, agent audio accounted in telephony bytes
+(67.3 s against 70.4 s wall — the 6x-inflation failure mode did not happen), tick loop clean. The
+provider works against a real container. The one FAIL is uninformative: the check requires a tool
+call or a tool name in the transcript, and the audio is a *retail* episode played against the *mock*
+domain's four tools, so there was nothing to call. The transcript is plainly responsive to the audio
+("To process this return, I will need your full name, order number, and a photo of the damaged
+items").
+
+**`retail`: dead at tick 3, and the reason is a hard blocker for arm C.** WebSocket 1011 "Internal
+server error", nothing else client-side. The cause is only in the container log: the backend
+hardcodes `max_model_len=6144` (`checkpoint_utils/load_utils.py:424`, a literal, not an env var) and
+retail's prompt plus its 16 tool schemas tokenize to **10978**, so vLLM refuses it in
+`_send_system_prompt` before any audio is processed. `session.update` had been ACKed with "7469
+chars of instructions accepted" — the prompt is not tokenized until the sequence starts, so the
+config check tells you nothing.
+
+Followed up with `tau-voice-2/scripts/nemo_rt_prompt_budget.py`, which measures the gate across all
+15 loadable domains instead of estimating it (each rejection prints an exact token count, pinning
+tokens-per-char at 0.481–0.582): **9 of 15 rejected outright**, including retail (10978) and airline
+(10708), telecom over by 2.4x (14854). Then the sharper finding — **"fits" is not "runs"**: `events`,
+`housing` and `media` clear the prompt gate and die mid-episode at 44.6 s, 16.2 s and 12.1 s with
+`append_request: request not found`, because the same 6144 tokens must also hold the conversation.
+Only `mock`, `banking` and `healthcare` completed a 68 s replay. Ordering by prompt+tools+generated
+text is monotone (9,886 ✓ / 10,898 ✓ / 10,937 ✗ / 11,442 ✗ / 12,163 ✗), which is a shared budget
+rather than a per-domain bug.
+
+Written up with the three ways out in `TAU_VOICE_SFT_PLAN.md` §0e-bis, which also corrects §0e: its
+32000-*character* gate is real but slack, and the binding limit is 3x tighter and in tokens. The
+underlying model is `max_position_embeddings=131072`, so 6144 is a serving choice and the literal is
+patchable in a writable container — but that deviates from the released config, so FDB-v3 numbers
+must not be re-quoted from a patched server. **This is Kai's call, not mine (see §7).**
 
 ---
 

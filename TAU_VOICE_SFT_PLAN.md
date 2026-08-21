@@ -827,6 +827,81 @@ averaged constant would misjudge exactly the domains near the limit.
 This limit is unrelated to §2b's `max_fc_total_tokens: 8000`: that one is a *training* budget in
 tokens and it drops cuts; this one is a *serving* budget in characters and it drops the config.
 
+### 0e-bis. The real gate is **6144 tokens**, not 32000 characters — measured live, 2026-08-21
+
+The table above is correct and irrelevant. `MAX_INSTRUCTIONS_LENGTH = 32000` is the server's own
+front-door check, and every domain but telecom clears it comfortably. Behind it sits a limit **3x
+tighter that nothing in `audio_server.py` checks**: the LLM backbone is launched with
+
+```python
+max_model_len=6144,          # checkpoint_utils/load_utils.py:424 — a literal, not an env var
+max_num_batched_tokens=768,  #                              :425
+```
+
+so a domain whose prompt plus serialized tool schemas exceeds 6144 tokens is refused by vLLM, not by
+the server. Found by the first live `nemo_rt` run (`tau-voice-2/scripts/nemo_rt_live_check.py
+--domain retail`), and **it is invisible from the client**: `session.update` is ACKed, the server
+logs `session configured (16 tools, input 16000 Hz, 7469 chars of instructions accepted)`, and then
+the *first audio chunk* closes the socket with WebSocket 1011 "Internal server error". The real
+error appears only in the container log —
+
+```
+ValueError: The decoder prompt (length 10978) is longer than the maximum model length of 6144.
+  ... model.py(2115): _send_system_prompt
+```
+
+— because the prompt is not tokenized until `sequence_started`. Any τ-voice run against a large
+domain would have looked like a network flake.
+
+`tau-voice-2/scripts/nemo_rt_prompt_budget.py` measures the boundary across all 15 loadable domains
+rather than estimating it: each rejection prints an exact token count, which pins tokens-per-char at
+**0.481–0.582** measured (JSON tool schemas tokenize badly), i.e. the 6144-token window is roughly
+**10.5k–12.8k characters** of prompt + tools.
+
+| verdict | domains | detail |
+|---|---|---|
+| **rejected at the prompt** (9/15) | retail **10978 tok**, airline 10708, telecom 14854, telecom-workflow 14666, restaurant 7070, transit 6854, car_rental 6602, hotels 6234, calendar 6326 | dies on the first audio chunk, WS 1011 |
+| **prompt fits but dies mid-episode** (3/15) | events (44.6 s), housing (16.2 s), media (12.1 s) | `append_request: request not found` |
+| **completed a 68 s replay** (3/15) | mock, banking, healthcare | |
+
+**The second row is the more important one, because "fits" is not "runs".** The 6144 tokens are a
+single budget shared by the prompt, the tool schemas, the generated text *and* the conversation
+audio, so a domain that clears the prompt gate still dies once the session fills the window — and
+the client sees the same uninformative 1011. Ordering the runs by prompt+tools+text-generated-by-
+death is monotone, which is what a shared budget predicts and a per-domain bug would not:
+
+| domain | prompt+tools | + transcript at death | outcome |
+|---|---|---|---|
+| healthcare | 9,394 | 9,886 | survived 68 s |
+| banking | 10,667 | 10,898 | survived 68 s |
+| events | 10,415 | **10,937** | died at 44.6 s |
+| housing | 11,139 | **11,442** | died at 16.2 s |
+| media | 12,027 | **12,163** | died at 12.1 s |
+
+Note that `banking` survives with a *larger* prompt than `events`, which is only consistent because
+banking's agent generated less than half the text (231 chars vs 522). Adding user audio at the
+model's 12.5 frames/s (80 ms `frame_length`) puts all five within a few hundred tokens of 6144.
+
+**What this means for the plan.** Arm C cannot be measured on `retail` or `airline` — the two
+canonical τ-bench domains — with the container as released, and `telecom` is out by 2.4x. The
+domains that work are `mock`, `banking` and `healthcare`, none of which is a τ-bench domain. Three
+ways out, in order of cost:
+
+1. **Raise the literal.** `load_utils.py:424` is patchable and `fdb_v3_serve.sh` already launches
+   with `--container-writable`; the underlying model is `nemotron_h` with
+   `max_position_embeddings=131072` (`triton-model-repo/nemotron-voicechat/1/nano-v2-vllm/config.json`),
+   so 6144 is a serving choice, not an architectural one. Costs KV/mamba cache memory — GPU 0 is
+   already at 126 GB of 143 GB with the current setting, so this needs measuring, not assuming.
+   **Caveat: it deviates from the released config, so the FDB-v3 numbers in
+   `FDB_V3_REPRODUCTION.md` must not be re-quoted from a patched server.**
+2. **Compress the domain prompt.** The tool schemas dominate — retail is 12,279 chars of tool JSON
+   against 7,469 of policy — so a terser schema serialization buys more than editing the policy.
+3. **Run arm C only on the domains that fit**, and say so. Cheapest, and it makes arm C
+   non-comparable to arm A/B on retail, which is most of arm C's point.
+
+This does not affect arms A and B: the research path loads the checkpoint directly and never goes
+through `load_utils.py`.
+
 ---
 
 ## 4. Phase 1 — Data generator fixes
