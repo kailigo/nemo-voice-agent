@@ -31,13 +31,17 @@
 # can cost 4 episodes and OOM on the way (see above). Reviewing pre-SFT episodes for
 # fabricated user content is not worth 4x on a checkpoint that barely speaks.
 #
-# COST: 24 episodes x 0.8-1.3 GPU-h = 19-31 GPU-h. Statically round-robined 3 per GPU, so
-# expect ~3-4 h of wall clock. Fits an allocation many times over (7-day limit).
+# COST: 24 episodes x 0.8-1.3 GPU-h = 19-31 GPU-h. Wall clock depends on how many slots the
+# run gets: 8 slots on one node is 3 episodes per GPU and ~3-4 h; 15-16 slots across two
+# nodes (see SLOT_OFFSET/TOTAL_SLOTS below) is 1-2 per GPU and ~1.2-2 h. Either fits an
+# allocation many times over (7-day limit).
 #
-# QUOTA: this is user-simulator ElevenLabs characters, ~200-2,000 per episode depending on
-# how far the conversation gets. 6,228 remained on 2026-08-18, so 24 episodes may exhaust
-# the free tier. A run that dies on quota fails LOUDLY (tts_retry reraises), and every
-# completed episode is already on disk in its own directory, so nothing is lost.
+# QUOTA IS NOT A GATE. The ElevenLabs key was replaced with a paid one on 2026-08-21, and the
+# measured cost is ~740 user-simulator characters per full 200 s episode (~18k for all 24) --
+# trivial. Concurrency is the only live limit and it is 15, so a 16-way fan-out stays under it.
+# Do not re-derive character budgets or route around ElevenLabs. If it ever does fail it fails
+# LOUDLY (tts_retry reraises), and every completed episode is already on disk in its own
+# directory, so nothing is lost.
 #
 # LAUNCH IT DETACHED. It holds 8 `srun --overlap` steps for hours, so it must not be tied to
 # an interactive shell or an agent tool call:
@@ -75,10 +79,15 @@ NGPU="${NGPU:-8}"
 # the comment there warns about.
 SLOT_OFFSET="${SLOT_OFFSET:-0}"
 TOTAL_SLOTS="${TOTAL_SLOTS:-$NGPU}"
+# Slot k runs on GPU (GPU_OFFSET + k). Needed on a node where the VoiceChat NIM container
+# already owns GPU 0 (fdb_v3_serve.sh pins CUDA_VISIBLE_DEVICES=0 and holds ~127 GB of 143):
+# NGPU=7 GPU_OFFSET=1 uses GPUs 1-7 and leaves the server alone. An episode landing on GPU 0
+# would OOM against the container rather than fail cleanly. MASTER_PORT is derived from the
+# GPU index downstream, so offsetting the GPU keeps the ports collision-free too.
+GPU_OFFSET="${GPU_OFFSET:-0}"
 STAGGER_SECONDS="${STAGGER_SECONDS:-20}"
 LOGDIR="${LOGDIR:-$HERE/../logs/$RUN}"
 
-STAGGER_SECONDS="${STAGGER_SECONDS:-20}"
 # Retry mode, set by scripts/tau2_watch_run.sh: run exactly the episodes in this TSV
 # instead of the generated subset, keep the existing progress log, and write to distinct
 # `--save-to` directories so a half-written first attempt is neither resumed nor
@@ -136,17 +145,19 @@ echo "stage 2: $MINE of $N_JOBS episodes on this node ($NGPU GPUs, global slots"
      "logs in $LOGDIR"
 
 # --- fan out ----------------------------------------------------------------
-# Static round-robin (job i -> GPU i % NGPU) rather than a work queue. 24 jobs over 8 GPUs
-# divides exactly, episode costs are within ~1.6x of each other, and the domains are
-# contiguous in the job list so round-robin also hands every GPU a mix of the three.
+# Static round-robin (job i -> global slot i % TOTAL_SLOTS) rather than a work queue. Episode
+# costs are within ~1.6x of each other, and the domains are contiguous in the job list so
+# round-robin also hands every slot a mix of the three. With TOTAL_SLOTS > N_JOBS/2 the split is
+# uneven by construction (24 jobs over 15 slots = 2 each for slots 0-8, 1 for the rest), so give
+# the node that frees up first the low SLOT_OFFSET.
 declare -a WORKER_PIDS=()
 
 for ((slot = 0; slot < NGPU; slot++)); do
   (
-    # Desynchronise the slots. All 8 episodes otherwise reach their first user utterance
-    # within the same second and contend for ElevenLabs' 2 concurrent request slots; the
-    # backoff in tau2_smoke_nemo.sh handles the collision, but not colliding is cheaper.
-    # 20 s x 8 slots costs 2.3 min of a 3-4 h run.
+    # Desynchronise the slots. Every episode otherwise reaches its first user utterance within
+    # the same second; the paid key allows 15 concurrent requests so this is now belt-and-braces
+    # rather than load-bearing, but it also spreads the ~79 GB model loads, and 20 s x 8 slots
+    # costs 2.3 min of a multi-hour run.
     sleep $((slot * STAGGER_SECONDS))
     i=0
     while IFS=$'\t' read -r domain task_id; do
@@ -159,11 +170,11 @@ for ((slot = 0; slot < NGPU; slot++)); do
       # Directory name must be filesystem-safe: telecom ids are not.
       slug=$(printf '%s' "$task_id" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)
       name="$RUN/${domain}__${slug}${NAME_SUFFIX}"
-      log="$LOGDIR/gpu${slot}__${domain}__${slug}${NAME_SUFFIX}.log"
+      log="$LOGDIR/gpu$((GPU_OFFSET + slot))__${domain}__${slug}${NAME_SUFFIX}.log"
 
       echo "[gpu $slot] START $domain $task_id" >>"$LOGDIR/progress.log"
       rc=0
-      TAU2_DOMAIN="$domain" "$HERE/tau2_smoke_nemo.sh" "$JOBID" "$slot" \
+      TAU2_DOMAIN="$domain" "$HERE/tau2_smoke_nemo.sh" "$JOBID" "$((GPU_OFFSET + slot))" \
         --task-ids "$task_id" \
         --max-steps-seconds "$CAP_SECONDS" \
         --hallucination-retries 0 \
