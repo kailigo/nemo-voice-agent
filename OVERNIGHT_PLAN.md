@@ -364,6 +364,162 @@ why B4 is a stretch rather than a filler.
 
 ---
 
+## 6b. RESULTS — live log, 2026-08-21
+
+Written as the work lands. **Timing note up front:** this plan was written ~07:20 on 2026-08-21, so
+what follows is a morning run of a few hours, not a whole night. The timeline in §4 should be read
+as relative offsets from 07:20, not as overnight hours.
+
+Status board at 08:10:
+
+| step | state | where |
+| --- | --- | --- |
+| A1 serve on jinja branch | **done, GATE PASSED** | `logs/fdb_v3/serve_jinja.log` |
+| A2 `nemo_rt_jinja` arm | **running, 30/100** | `logs/fdb_v3/infer_nemo_rt_jinja.log` |
+| A3 score the new arm | blocked on A2 | — |
+| A4 live `nemo_rt` check | script written, not yet run | `tau-voice-2/scripts/nemo_rt_live_check.py` |
+| A5 concurrency probe | blocked on A2 | — |
+| B1 Parakeet ASR pass | **done, 100/100, 0 failures** | `logs/fdb_v3/asr_nemo_rt.log` |
+| B2 re-score with latency | **done** | `logs/fdb_v3/eval_nemo_rt_withlatency.log` |
+| B3 bare-vs-protocol A/B | not started | — |
+| B4 token budget | not started | — |
+
+### A1 — gate passed
+
+Container reached ready in ~9 min (two vLLM EngineCore loads, pids 3895513/3897517, no errors).
+Health: `{"status":"ok", "mode":"triton", "triton_status":"ready",
+"model_inference_stats":{"success_count":241,"fail_count":0}}`. Serving at `ws://ip-10-1-30-86:9000`.
+
+The branch proof, which is the thing that actually gates the arm (counts as of 08:10, after 30
+sessions):
+
+```
+grep -c 'Preparing prompt using jinja template'  logs/fdb_v3/serve_jinja.log  ->  31   (must be >0)  ✓
+grep -c 'Call a tool ONLY when the user'         logs/fdb_v3/serve_jinja.log  ->   0   (must be  0)  ✓
+```
+
+So `USE_JINJA_TEMPLATE_PROMPT=1` took effect and **no restraint text reached the model** — the
+opposite of the 100-session default-branch run in `FDB_V3_REPRODUCTION.md` §3 deviation 2. This is
+the first faithful-prompt arm.
+
+### A2 — running, and slower than planned
+
+Clean so far: every example `status=completed`, `rtf` 1.002–1.007, no server errors, no rejects.
+Per-turn latency in the log is 0.48–0.8 s, matching the default-branch arm.
+
+**Pace correction: ~1.7 min/example, so ~2 h 50 m total, not the planned 85 min.** The plan assumed
+~50 s/example from audio duration alone; it ignored the ~20 s `--trailing-silence` plus connect and
+teardown per example. Projected finish ~10:00. This pushes A3 to ~10:15 and A5 after that; A4 is
+unaffected because it needs only a live server, not an idle one.
+
+The model is over-calling on the jinja branch too — e.g. `ecommerce_13`: expected
+`['add_to_cart','track_order']`, got `['add_to_cart','track_order','track_order',
+'update_identity_doc']`. **Not a result yet** — n=30, and `update_identity_doc` was already the most
+frequent spurious call on the default branch (10 occurrences). Worth noting only because it is the
+early signal for A3's second outcome ("doesn't move"). Wait for the score.
+
+### B1 + B2 — the latency section exists for the first time, and it needs two numbers
+
+B1's flagged risk did not materialise: `nvidia/parakeet-tdt-0.6b-v2` downloaded from a compute node
+without trouble, 100/100 transcribed, 0 failures. B2 then re-scored `nemo_rt` end to end (372 judge
+calls, 0 failed). Headline metrics are unchanged from the 2026-08-19 run, as they must be — B1 only
+adds `user_speech_end_rel`, which no headline metric reads:
+
+```
+tool_selection_acc 73.1 % (n=98) / 71.7 % (n=100)   card 82.5 %
+argument_acc       51.7 % (n=98) / 50.7 % (n=100)   card 44.2 %
+pass_rate (Pass@1) 35.0 % (n=100)                   card 33.0 %
+```
+
+The new part, `logs/fdb_v3/nemo_rt_latency_report.json`:
+
+| | N | mean | median | min / max |
+| --- | --- | --- | --- | --- |
+| First response (FDB metric) | 63 | 4.05 s ± 3.22 | 3.04 s | 0.32 / 15.44 s |
+| Tool call | 51 | 1.46 s ± 1.93 | 1.12 s | −1.76 / 11.12 s |
+| Task completion | 63 | 4.82 s ± 5.45 | 3.20 s | 0.32 / 35.36 s |
+| Filler usage | 3/63 (5 %) | | | |
+
+**4.05 s is not comparable to the card's 448 ms, and neither is the 0.64 s we have been quoting.
+They anchor to different instants, and the gap between the anchors is the actual finding.**
+
+* **FDB's anchor** is the acoustic end of the user's *first* turn — Parakeet word timestamps split
+  on a >2.0 s gap (`fdb_v3_asr_input.py::speech_end`, the benchmark's own rule from
+  `run_tool_benchmark.py:358`). `first_response_latency = agent's first word − that instant`.
+* **Our anchor** (`response_latency_s`, in every result file) is *the server's own ASR
+  end-of-speech marker*. Aggregated over all 100 files: **135 turns on 98 examples, mean 0.730 s,
+  median 0.64 s, sd 0.954, floor 0.48 s, p90 0.80 s, max 9.44 s.** First turn only: n=98, mean
+  0.699 s, median 0.64 s.
+
+Reconciling them per example (`marker = agent_first_word − response_latency_s[0]`, then
+`delta = marker − acoustic end of turn 1`):
+
+| set | N | delta median | delta mean | reading |
+| --- | --- | --- | --- | --- |
+| FDB keeps (FR ≥ 0) | 63 | **+2.32 s** | +3.31 s | server declared the turn over *later* than the audio did |
+| FDB drops (FR < 0) | 35 | **−11.28 s** | −11.77 s | server declared it over *mid-turn* and the agent started talking |
+
+So the server-anchored 0.64 s is **flattering, not conservative**: on the 63 kept examples the
+server's end-of-speech marker sits a median 2.3 s *after* the user actually stopped, and latency
+measured from a late anchor is small by construction.
+
+**This corrects a claim in `FDB_V3_REPRODUCTION.md` §1**, which said the marker "lags the acoustic
+end, so these are if anything pessimistic." The direction is backwards — a lagging anchor makes the
+number optimistic — and the lag is not uniform: it is +2.3 s median on 63 examples and −11.3 s
+median on the other 35.
+
+**The 35 dropped examples are the more interesting half.** All 35 have a perfectly clean
+server-anchored first-turn latency (0.48–0.96 s, median 0.64, every one positive), so nothing looks
+wrong from the server's side. What happened is that the server's end-of-speech fired at an
+*intra-turn* pause and the agent began speaking while the same user turn was still going. Worked
+example, `ecommerce_01_65e8cf8f4c7424fa062e54a3` — the user's turn 1 is one continuous 14 s
+utterance, 1.20 s → 15.28 s, no internal gap above 0.56 s:
+
+```
+ 8.88-10.16  "Could you track it for me?"     <- server calls end-of-speech here (~10.32)
+10.80        agent's first word                  server-anchored latency 0.48 s
+10.48-15.28  "The order ID is A B C one two three."   <- user is still in the same turn
+```
+
+FDB scores that FR = 10.80 − 15.28 = **−4.48 s** and drops it as an interruption. Both measurements
+are correct; they disagree about where a turn ends.
+
+**Hypothesis this raises (not yet tested).** The agent begins speaking mid-turn on **35 of 98
+examples (36 %)**, at pauses as short as ~0.3 s. That is the same eagerness that shows up in Tool
+Selection as **184 calls emitted vs 150 expected (1.23x over-calling)**. Two independent
+measurements of one behaviour would be a much stronger story than either alone — and if A2's jinja
+arm moves the over-calling, re-running this latency analysis on `nemo_rt_jinja` tests whether the
+barge-in rate moves with it. That is a cheap, concrete next experiment; **B1's second pass over
+`nemo_rt_jinja` should therefore be treated as load-bearing, not as a nice-to-have.**
+
+Caveat that stands regardless: for the container arm the agent channel *is* audio, so `asr_chunks`
+timestamps are real speech onsets and this analysis is sound. The same numbers on a research-path
+arm would be first-*token* times, which are not comparable.
+
+### One stale field found in the old result files
+
+Every `result_nemo_rt.json` carries `notes.prompt` = *"the tool block is rendered server-side from
+/s2s/prompt_template.jinja"*. **That is wrong for the `nemo_rt` arm** — those 100 sessions ran the
+default `TOOLS_TEMPLATE` branch, as deviation 2 establishes. The note was written before the branch
+was discovered. `--server-prompt-mode` (added for A2) stamps the branch explicitly, so
+`result_nemo_rt_jinja.json` will be self-describing; the `nemo_rt` files are not, and a future
+reader trusting that note would mislabel the arm. Do not fix by editing the files in place —
+provenance is better served by this note than by a rewrite.
+
+### A4 — script written, not yet run
+
+`tau-voice-2/scripts/nemo_rt_live_check.py` exists and parses. It drives
+`DiscreteTimeNemotronRTAdapter` directly from the user channel of a recorded stereo `both.wav`
+(auto-detected as the louder channel), converted PCM16 → μ-law with `audioop.lin2ulaw`, so it spends
+**zero ElevenLabs characters**. It reports the four falsifiable claims from §2 A4 as explicit
+PASS/FAIL lines plus `chunks_dropped`, and writes `logs/nemo_rt_live_check_<domain>.json`.
+
+Deliberately **not** run yet: it would open a second concurrent session against the server while A2
+is mid-arm, and §2 A5 rules that out — a contended server would silently degrade the deliverable.
+It runs after A2 completes, `--domain mock` first, then `retail`.
+
+---
+
 ## 7. Left for Kai — do not decide these alone
 
 1. Push the 4 unpushed commits?

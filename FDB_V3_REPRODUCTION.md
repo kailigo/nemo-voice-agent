@@ -53,8 +53,12 @@ Measured on the container, 2026-08-19, one H200 (`scripts/voicechat_realtime_lat
 | turn-taking latency (ASR end-of-speech → agent speech onset) | 794 ms | 476 ms, 639 ms |
 | inferences per second of audio | 6.27 | 6.25 |
 
-The card quotes 448 ms smooth turn-taking latency; ours is measured from the server's own ASR
-end-of-speech marker, which lags the acoustic end, so these are if anything pessimistic.
+The card quotes 448 ms smooth turn-taking latency. Ours is measured from the server's own ASR
+end-of-speech marker, and **that makes it optimistic, not pessimistic** — corrected 2026-08-21, see
+§5. The marker does not coincide with the instant the user stopped talking: measured across the full
+run it sits a median 2.3 s *after* the acoustic end of the user's turn on the 63 examples the
+benchmark's own latency metric keeps, and *before* the turn has finished on the other 35. A latency
+measured from a late anchor is small by construction.
 
 The two paths also *behave* differently, so this is not only a cost question. On `ecommerce_01`
 the research path hallucinated `order_id: "LHR"`; the container returned
@@ -281,6 +285,60 @@ Until `nemo_rt_jinja` is run, the honest statement is: **Pass@1 reproduces, argu
 comparable because the judge differs, and Tool Selection is 9.4 points short — measured on a
 prompt that carried two contradictory tool-use policies, so the number is not yet attributable.**
 
-Not yet measured: the latency section. `analyze_tool_latency.py` reports `total_samples: 0`
-without `user_speech_end_rel`, which needs `scripts/fdb_v3_asr_input.py` (Parakeet over
-`input.wav`) to run first.
+## 5. Latency, measured 2026-08-21
+
+`scripts/fdb_v3_asr_input.py` (Parakeet over `input.wav`, 100/100, 0 failures) supplied the missing
+`user_speech_end_rel`, so `analyze_tool_latency.py` runs for the first time. Re-scoring changed no
+headline metric — nothing in §4 reads that field.
+
+`logs/fdb_v3/nemo_rt_latency_report.json`:
+
+| | N | mean | median | min / max |
+| --- | --- | --- | --- | --- |
+| First response | 63 | 4.05 s ± 3.22 | 3.04 s | 0.32 / 15.44 s |
+| Tool call | 51 | 1.46 s ± 1.93 | 1.12 s | −1.76 / 11.12 s |
+| Task completion | 63 | 4.82 s ± 5.45 | 3.20 s | 0.32 / 35.36 s |
+| Filler usage | 3/63 (5 %) | | | |
+
+**Neither this 4.05 s nor the 0.64 s quoted in §1 is comparable to the card's 448 ms**, and the
+reason is the anchor, not the model:
+
+* **FDB anchors on the acoustic end of the user's first turn** — Parakeet word timestamps split on a
+  >2.0 s gap, the benchmark's own rule (`run_tool_benchmark.py:358`).
+* **Our `response_latency_s` anchors on the server's ASR end-of-speech marker.** Aggregated over all
+  100 result files: **135 turns on 98 examples, mean 0.730 s, median 0.64 s, floor 0.48 s, p90
+  0.80 s.** First turn only: n=98, median 0.64 s.
+
+Reconciling per example (`marker = agent_first_word − response_latency_s[0]`, `delta = marker −
+acoustic end of turn 1`):
+
+| set | N | delta median | reading |
+| --- | --- | --- | --- |
+| FDB keeps (FR ≥ 0) | 63 | **+2.32 s** | server called the turn over *after* the audio did |
+| FDB drops (FR < 0) | 35 | **−11.28 s** | server called it over *mid-turn*; the agent started talking |
+
+**The 35 dropped examples are the finding.** All 35 have a clean server-anchored first-turn latency
+(0.48–0.96 s, median 0.64, every one positive), so nothing looks wrong server-side. What happened is
+that end-of-speech fired at an *intra-turn* pause. `ecommerce_01_65e8cf8f4c7424fa062e54a3` — the
+user's turn 1 is one continuous 14 s utterance, 1.20 → 15.28 s, no internal gap above 0.56 s:
+
+```
+ 8.88-10.16  "Could you track it for me?"    <- server calls end-of-speech (~10.32 s)
+10.80        agent's first word                 server-anchored latency 0.48 s
+10.48-15.28  "The order ID is A B C one two three."   <- same user turn, still going
+```
+
+FDB scores FR = 10.80 − 15.28 = **−4.48 s** and drops it as an interruption. Both measurements are
+correct; they disagree about where a turn ends.
+
+So the honest latency claim is: **once the server decides the user has stopped, it replies in a
+median 0.64 s — but on 35 of 98 examples (36 %) it decides that mid-turn and talks over the user.**
+
+**Open hypothesis.** That 36 % barge-in rate and the 1.23x over-calling in §4 may be one behaviour —
+an agent acting before the user has finished asking. Testing it is cheap: re-run this analysis on
+`nemo_rt_jinja` and see whether the barge-in rate moves together with the call count. Until then it
+is a hypothesis, not a mechanism.
+
+Caveat, per arm: the container's agent channel *is* audio, so `asr_chunks` timestamps are real
+speech onsets and the analysis is sound. On a research-path arm the same field holds first-*token*
+times, which are not comparable to any of the above.
