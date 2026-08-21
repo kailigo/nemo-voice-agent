@@ -13,16 +13,28 @@ This document is the audit trail for reproducing them with the released checkpoi
 benchmark actually requires, which parts of the published pipeline we run unchanged, which we
 replaced and why, and what the numbers came out to.
 
-**Where it landed:** Pass@1 reproduces (35.0 % vs 33 %), argument accuracy is not comparable because
-the judge differs, and Tool Selection is 10.8 points short. Eleven candidate deployment discrepancies
-were measured and eliminated — see [the discrepancy audit](#the-discrepancy-audit-2026-08-21--eleven-suspects-eliminated-and-where-the-11-points-are).
-The gap is half spurious tool firing, half recall shortfall, and all of it in the 30 `hard`
-scenarios. The public harness contains no NVIDIA provider, so the integration behind 82.5 % cannot be
-diffed against ours. A final path-vs-path test on those 30 scenarios identified the mechanism: the two
-inference paths sit at different points on an eagerness/caution trade-off, and Tool Selection — a
-function-*name* metric — rewards eagerness, so the same episodes reverse order once arguments are
-scored. That makes the card's own 82.5 % / 44.2 % pair coherent against our 71.7 % / 50.7 %, and the
-numbers are **accepted as measured**.
+**Where it landed — CLOSED, 2026-08-21.** All three metrics are measured on all three arms, and the
+card's operating point sits *between* our two inference paths:
+
+| metric | research path | container | card |
+| --- | --- | --- | --- |
+| Tool Selection | **78.3 %** | 73.1 % | 82.5 % |
+| Argument accuracy | 30.3 % | **51.7 %** | 44.2 % |
+| Pass@1 | 23.0 % | **35.0 %** | 33 % |
+
+The container reproduces Pass@1 (35.0 % vs 33 %), *overshoots* argument accuracy (51.7 % vs 44.2 %)
+and is 9.4 points short on Tool Selection; the research path is closest on Tool Selection (−4.2) and
+worse on both judged metrics. Eleven candidate deployment discrepancies were measured and eliminated
+— see [the discrepancy audit](#the-discrepancy-audit-2026-08-21--eleven-suspects-eliminated-and-where-the-11-points-are).
+The residual Tool Selection gap is not mysterious: 40 never-expected calls (27 cross-domain) plus 7
+duplicates, whose removal scores 82.1 % with recall untouched — a precision deficit, concentrated in
+the 30 `hard` scenarios. The public harness contains no NVIDIA provider, so the integration behind
+82.5 % cannot be diffed against ours; what a path-vs-path test *can* establish is the mechanism, and
+it does: the two paths sit at different points on an eagerness/caution trade-off, and Tool Selection —
+a function-*name* metric — rewards eagerness, so the same episodes reverse order once arguments are
+scored. Judge substitution (Sonnet 4.5 for the card's unavailable gpt-4o) is worth up to 4.7 points
+and is bounded with a second judge rather than merely disclosed; the ordering above is
+judge-invariant. The numbers are **accepted as measured**.
 
 Benchmark checkout: `/fsx/home/kai.li/code/Full-Duplex-Bench/v3` (unmodified — nothing in
 this reproduction edits it).
@@ -538,45 +550,64 @@ Tool Selection lands **4.2 points short**, and the residual is fully accounted f
 calls (27 of them *cross-domain*) plus 7 exact duplicates. Deleting those while leaving recall
 untouched scores **82.1 %**, within 0.4 of the card. It is a precision deficit, not a recall deficit.
 
-**The argument row was not comparable, and that mattered.** The card's 44.2 % came from `--use-llm`,
-whose judge is told to forgive `$RESULT` references, date formats, aliases, ±5 % numerics and
-underscore-vs-space; `exact_match_args` forgives none of it. So 22.2 % / 36.7 % / 32.8 % are a strict
-lower bound on the same behaviour, not a deficit. `scripts/fdb_v3_judge_args.py` supplies the
-comparable number — 209 distinct verdicts (345 before dedup), two judge families, per-verdict audit
-logs under `logs/fdb_v3_judge/`:
+Running the full judged suite (`scripts/fdb_v3_evaluate.py --provider nemo_research`, 292 judge calls,
+0 failed) completes the three-arm × three-metric table. Every judged cell is Sonnet 4.5 via Bedrock:
 
-| arm | exact-match | judge: Sonnet 4.5 | judge: gpt-oss-120b |
+| metric | `nemo_research` | `nemo_rt` | `nemo_rt_jinja` | card | judge? |
+| --- | --- | --- | --- | --- | --- |
+| Tool Selection | **78.3 %** | 73.1 % | 70.8 % | 82.5 % | no |
+| Argument accuracy | 30.3 % | **51.7 %** | 48.2 % | 44.2 % | yes |
+| Pass@1 | 23.0 % | **35.0 %** | 31.0 % | 33.0 % | yes |
+
+**Neither arm matches the card and the card sits between them.** The container is 9.4 points short on
+names while *overshooting* on arguments (51.7 % vs 44.2 %) and landing on Pass@1 (35.0 % vs 33.0 %);
+the research path is closest on names (−4.2) and clearly worse on both judged metrics. This is the
+eagerness/caution axis of §4 measured on all three published numbers at once, and it says the released
+weights reach either side of the card by orchestration alone.
+
+**A second, independent implementation of the argument metric** — `scripts/fdb_v3_judge_args.py` —
+was written to test whether the judge substitution is load-bearing, since §4 flagged that risk without
+bounding it. It reaches the same verdicts by a different route (209 deduplicated verdicts against the
+suite's 292, greedy replay against a recorded cache rather than inline calls) and **agrees to within
+0.5 points on every arm**: 51.7 % vs 51.7 %, 48.2 % vs 48.2 %, 30.8 % vs 30.3 %. The judged numbers
+above are therefore corroborated, not merely repeated. What the second implementation adds:
+
+| arm | `exact_match_args` | Sonnet 4.5 | gpt-oss-120b |
 | --- | --- | --- | --- |
 | `nemo_research` | 22.2 % | 30.8 % | 26.1 % |
 | `nemo_rt` | 36.7 % | **51.7 %** | **47.3 %** |
 | `nemo_rt_jinja` | 32.8 % | 48.2 % | 43.7 %–44.7 % |
 | card | — | **44.2 %** | **44.2 %** |
 
-**On both judges the container path meets or beats the card on arguments (47.3–51.7 % vs 44.2 %)
-while sitting 9.4 points below it on names, and the research path is closer on names but far below on
-arguments.** The card's operating point lies *between* our two arms, on the same eagerness/caution
-axis §4 identified. That is a stronger and more useful result than a match would have been: it says
-the released weights can be driven to either side of the card's numbers by orchestration alone.
-
-Three caveats, all recorded rather than smoothed over:
+The `exact_match_args` column is what `--use-llm`-less runs report and is a strict lower bound, not a
+result: it is worth 14–15 points on this benchmark, so **running the argument metric without a judge
+is a different metric, not a neutral one.** Three caveats, recorded rather than smoothed over:
 
 * **The card's judge is unreproducible here.** It is `gpt-4o`; there is no OpenAI key on this cluster
   and Bedrock's catalogue has no gpt-4o. These are our judges applying the card's rubric verbatim
   (`assert_rubric_unchanged()` fails loudly if the upstream rubric drifts from the copy in the
   script), not the card's number.
-* **The judges disagree by up to 4.7 points**, so quote a range and name the judge. gpt-oss is
-  systematically stricter (rejections −6/−5/−7 against Sonnet's −3/−0/−2), and the audit shows why:
-  both reject calls carrying *extra* fabricated arguments — a `passenger_name: "user_1234"` on an
-  `add_to_cart`, a hallucinated `max_price: 1000` on `search_apartments` — which `exact_match_args`
-  forgives by construction, since it only iterates the expected keys. The rubric is silent on extras,
-  so that strictness is judge-invented; it is defensible, and it is not the card's convention.
+* **The two judges disagree by up to 4.7 points**, which is the bound §4 was missing — the
+  substitution *is* load-bearing, so quote a range and name the judge. gpt-oss is systematically
+  stricter (rejections −6/−5/−7 against Sonnet's −3/−0/−2), and the audit shows why: both reject calls
+  carrying *extra* fabricated arguments — a `passenger_name: "user_1234"` on an `add_to_cart`, a
+  hallucinated `max_price: 1000` on `search_apartments` — which `exact_match_args` forgives by
+  construction, since it only iterates the expected keys. The rubric is silent on extras, so that
+  strictness is judge-invented; it is defensible, and it is not the card's convention. Crucially the
+  *ordering and the conclusion are judge-invariant*: on both judges the container beats the card on
+  arguments and the research path is far below it.
 * **One verdict was unobtainable** — Bedrock returns an empty completion for a passport-number
   comparison, evidently a content filter. It is reported as an interval (both substitutions scored)
   rather than dropped. This matters because `llm_judge_argument` wraps its call *and* its parse in a
   bare `except Exception: return exact_match_args(...)`: under plain `--use-llm` a filtered response,
   a throttle or a truncated body silently becomes an exact-match verdict and the run reports ~22 %
   looking like it judged. The script counts judged / unparseable / api-failed separately and
-  suppresses the number outright above a 5 % miss rate.
+  suppresses the number outright above a 5 % miss rate. `fdb_v3_evaluate.py` reports its own
+  `judge calls: N (M failed)` line for the same reason — check it, do not assume it.
+
+**This closes the reproduction.** All three published metrics are measured on all three arms, the
+one gap (4.2 points of Tool Selection) is attributed to a specific and countable behaviour, and the
+judge-substitution risk is bounded rather than merely disclosed.
 
 ## 5. Latency, measured 2026-08-21
 
