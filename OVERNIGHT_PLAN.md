@@ -645,9 +645,19 @@ must not be re-quoted from a patched server. **This is Kai's call, not mine (see
 
 ## 7. Left for Kai — do not decide these alone
 
-1. Push the 4 unpushed commits?
+1. Push the unpushed commits? (8 across the two repos as of this writing.)
 2. Local TTS behind `synthesis/synthesize.py:22`, or wait for a paid ElevenLabs key? Gates all of
    arm A beyond replay experiments.
 3. Raise `max_fc_total_tokens` to 12,000 in the training config (B4 measures whether it fits;
    changing the config is his call).
 4. Whether to spend the last 304 ElevenLabs characters on anything at all.
+5. **New, and it blocks arm C: how to get past the container's 6144-token window?** Nine of 15
+   domains — including retail and airline — cannot be served at all as released, and three more die
+   seconds into an episode. The options are in `TAU_VOICE_SFT_PLAN.md` §0e-bis: patch the literal at
+   `load_utils.py:424` (cheap, needs a memory measurement, and **deviates from the config the FDB-v3
+   numbers were measured under**), compress the tool-schema serialization, or restrict arm C to
+   `mock`/`banking`/`healthcare` and accept that it stops being comparable to arms A and B on
+   retail. I did not pick one.
+6. Whether the Tool Selection gap being ~11 pts on *both* prompt branches (§6b A3) is worth another
+   hypothesis or worth reporting as-is. The prompt is ruled out; the remaining suspects are the
+   checkpoint (`stt_extracted_lora` vs whatever the card measured) and the audio front end.
