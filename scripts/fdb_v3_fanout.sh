@@ -27,6 +27,12 @@ NGPU="${NGPU:-8}"
 # GPU 0 (fdb_v3_serve.sh pins CUDA_VISIBLE_DEVICES=0): NGPU=7 GPU_OFFSET=1 uses GPUs 1-7 and
 # leaves the server untouched. Shard indices stay 0..NGPU-1 so the split is independent of it.
 GPU_OFFSET="${GPU_OFFSET:-0}"
+# Two nodes, one split. Shard k of this invocation runs global shard (SHARD_OFFSET + k) of
+# TOTAL_SHARDS, so a 15-way split can be launched as 7 shards here (SHARD_OFFSET=0) and 8 on a
+# second allocation (SHARD_OFFSET=7, TOTAL_SHARDS=15) with no overlap and no double-running.
+# Give each node its own RUN_NAME, or the two sets of gpuN.log files collide.
+SHARD_OFFSET="${SHARD_OFFSET:-0}"
+TOTAL_SHARDS="${TOTAL_SHARDS:-$NGPU}"
 BASE_PORT="${BASE_PORT:-29700}"
 RUN_NAME="${RUN_NAME:-fdb_v3}"
 LOGDIR="${LOGDIR:-$HERE/../logs/$RUN_NAME}"
@@ -37,7 +43,7 @@ PROGRESS="$LOGDIR/progress.log"
 
 note() { echo "[fanout $(date -u +%H:%M:%S)] $*" | tee -a "$PROGRESS"; }
 
-note "$NGPU shards on job $JOBID, extra args: $*"
+note "$NGPU shards on job $JOBID (global $SHARD_OFFSET..$((SHARD_OFFSET + NGPU - 1)) of $TOTAL_SHARDS), extra args: $*"
 
 pids=()
 for gpu in $(seq 0 $((NGPU - 1))); do
@@ -50,10 +56,10 @@ for gpu in $(seq 0 $((NGPU - 1))); do
     export CUDA_VISIBLE_DEVICES=$((GPU_OFFSET + gpu))
     export MASTER_PORT=\$(($BASE_PORT + $gpu))
     exec '$ENV_PREFIX/bin/python' -u '$HERE/fdb_v3_nemo_infer.py' \
-      --shard $gpu --num-shards $NGPU $(printf '%q ' "$@")
+      --shard $((SHARD_OFFSET + gpu)) --num-shards $TOTAL_SHARDS $(printf '%q ' "$@")
   " >"$log" 2>&1 &
   pids+=($!)
-  note "shard $gpu -> gpu $((GPU_OFFSET + gpu)), log $log"
+  note "global shard $((SHARD_OFFSET + gpu))/$TOTAL_SHARDS -> gpu $((GPU_OFFSET + gpu)), log $log"
 done
 
 rc_total=0
