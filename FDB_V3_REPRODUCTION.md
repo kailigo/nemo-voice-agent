@@ -18,7 +18,11 @@ the judge differs, and Tool Selection is 10.8 points short. Eleven candidate dep
 were measured and eliminated — see [the discrepancy audit](#the-discrepancy-audit-2026-08-21--eleven-suspects-eliminated-and-where-the-11-points-are).
 The gap is half spurious tool firing, half recall shortfall, and all of it in the 30 `hard`
 scenarios. The public harness contains no NVIDIA provider, so the integration behind 82.5 % cannot be
-diffed against ours.
+diffed against ours. A final path-vs-path test on those 30 scenarios identified the mechanism: the two
+inference paths sit at different points on an eagerness/caution trade-off, and Tool Selection — a
+function-*name* metric — rewards eagerness, so the same episodes reverse order once arguments are
+scored. That makes the card's own 82.5 % / 44.2 % pair coherent against our 71.7 % / 50.7 %, and the
+numbers are **accepted as measured**.
 
 Benchmark checkout: `/fsx/home/kai.li/code/Full-Duplex-Bench/v3` (unmodified — nothing in
 this reproduction edits it).
@@ -341,7 +345,7 @@ below is a measurement, not a reading of the docs.
 
 | suspect | verdict | evidence |
 | --- | --- | --- |
-| Checkpoint provenance — Triton repo not built from the released weights | eliminated | triton-model-repo config vs released `voicechat-11b` config: **0** keys unique to either side, exactly **1** differing value (`model.stt.model.pretrained_asr`: `None` vs `''`). Against `stt_extracted_lora`, 339/340 keys mismatch. It is the released checkpoint. |
+| Checkpoint provenance — Triton repo not built from the released weights | eliminated | triton-model-repo config vs released `voicechat-11b` config: **0** keys unique to either side, exactly **1** differing value (`model.stt.model.pretrained_asr`: `None` vs `''`). Against `stt_extracted_lora`, 339/340 keys mismatch — **config layout only, not weights**; those are bit-identical (see the research-path test below). It is the released checkpoint. |
 | Prompt branch / restraint text | eliminated | both arms run at n=100, 71.7 % and 70.8 % (§4 above). |
 | Trailing-silence convention (our 20 s vs FDB's 1.5 s) | eliminated | only **2 of 184** calls fall outside FDB's own capture window (`livekit_inference.py`: `target_samples = duration_sec × 24 kHz`, +1500 ms). Truncating to their window: 71.7 → 71.9 %, 70.8 → 70.8 %. |
 | LiveKit VAD / turn-detection layer we don't have | eliminated | `lk_agent_tool.py:413` is `AgentSession(llm=model, tools=tools)` — no `vad`, no `turn_detection`. There is no layer to be missing. |
@@ -427,6 +431,92 @@ integration behind the card's 82.5 % is not in the public repo, so no further di
 possible from released artifacts. Anything more would have to come from NVIDIA — specifically whether
 their FDB-v3 row was produced through this container at all, or through the research path with a
 different tool-call surface.
+
+### The research-path test, 2026-08-21 — the gap is eagerness, and Tool Selection rewards it
+
+The audit's last open item — container or research path? — is testable without NVIDIA, because both
+paths run the same weights. `scripts/fdb_v3_nemo_infer.py` was given a `--difficulty` filter and run
+over the 30 `hard` scenarios that hold the entire residual, as provider `nemo_research_hard`.
+
+**Same weights, first.** The research path loads `stt_extracted_lora`, which the table above records
+as mismatching the released config on 339/340 keys — but that is a *config-layout* difference, not a
+weights difference, and reading it as the latter would have made this comparison meaningless.
+`scripts/verify_checkpoint_identity.py`: 9/9 sampled tensors **bit-identical** to `voicechat-11b`, 0
+shape or dtype differences, the 2 ours-only tensors are copies of released ones, and the 650
+released-only tensors are all `tts_model.*` (635) + `rnnt_decoder.*` (9) + `rnnt_joint.*` (6) — the
+speech-synthesis and RNNT heads the research path does not use. The comparison is path vs path.
+
+| arm, 30 `hard` scenarios | expected | actual | matched | recall | precision | Tool Selection | statuses |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `nemo_research_hard` | 72 | 86 | 51 | 70.8 % | 59.3 % | **72.7 %** | 30 completed |
+| `nemo_rt` | 72 | 94 | 51 | 70.8 % | 54.3 % | 60.9 % | 29 completed, 1 `inference_error` |
+| `nemo_rt_jinja` | 72 | 75 | 48 | 66.7 % | 64.0 % | 60.9 % | 30 completed |
+
+The research path wins the hard bucket by 11.8 points — and the mechanism is not tool *choice*.
+Matched calls are identical (51 vs 51), spurious-function counts are identical (14 vs 14). What
+differs is **silence: 5 of 30 container episodes emit no tool call at all, against 1 for the research
+path.** That is the whole deficit.
+
+Two explanations were tested and both are refuted:
+
+* **Context pressure against the 6144-token window** — refuted, and backwards. The zero-call
+  episodes are *shorter* than average: audio p50 19.3 s vs 20.8 s, max 24.2 s vs 50.2 s. The
+  episodes that overflow the window are the ones that answer.
+* **Barge-in / committing to speech before the request finishes** — refuted for 4 of the 5. In
+  `finance_18` (first agent onset 20.9 s, user audio ends 19.4 s), `finance_23` (18.6 / 17.9),
+  `housing_19` (14.5 / 13.5) and `housing_21` (23.0 / 19.3) the agent begins speaking *after* the
+  user has finished, with nothing left to interrupt. Only `travel_23` fits the pattern (a 2.8 s
+  greeting ahead of a later request).
+
+What the container does instead is **ask for the missing argument** — "I just need to know how much
+you would like to convert", "I just need your starting address", "Just let me know the city you are
+in" — which is exactly what the benchmark's own instructions forbid in capitals ("DO NOT ASK
+CLARIFYING QUESTIONS… DO NOT reply with a question or conversational filler instead of calling the
+tool"). It is a real deficiency against this benchmark. It is not a broken serving path.
+
+**And the research path's advantage is largely an artifact, because Tool Selection scores function
+names only.** Rescoring the same 30 episodes with arguments included reverses the order
+(`scripts/fdb_v3_name_vs_args.py`, greedy one-to-one matching so a tool fired five times cannot
+earn five credits):
+
+| arm, 30 `hard` | name-only F1 | name + args (lenient) | name + args (strict) |
+| --- | --- | --- | --- |
+| `nemo_research_hard` | **71.6 %** | 22.5 % | 19.3 % |
+| `nemo_rt` | 56.4 % | **25.4 %** | 21.8 % |
+| `nemo_rt_jinja` | 55.5 % | **28.8 %** | **22.7 %** |
+
+"lenient" requires the actual call to match every argument the expected call specifies and forgives
+extras; "strict" is full dict equality; both normalise case, leading articles and punctuation, and
+both drop the 13 of 72 expected calls whose arguments contain a `$RESULT_n` placeholder, since those
+can never match. Name-only differs slightly from the table above because of that denominator change.
+
+The four episodes where the container fired nothing show what the name-only metric is paying for:
+
+```
+finance_23   expected  modify_autopay {"bill_type":"mortgage","source_account":"savings"}
+             research  modify_autopay {"bill_type":"credit_card", ...}    <- wrong bill, full credit
+finance_18   expected  get_exchange_rate + get_card_benefits {"card_type":"premium"}
+             research  get_exchange_rate {1000, USD->EUR} correct; get_card_benefits {"platinum"}
+housing_21   expected  search_apartments {"bedrooms":3} + calculate_commute {...}
+             research  search_apartments {"city":"Tokyo","bedrooms":3,"max_price":1000}
+                       + search_flights x8  (Tokyo/LHR/JFK/ORD, repeated)
+housing_19   expected  calculate_commute {"origin":"my house","dest":"the gym","mode":"driving"}
+             research  essentially correct                               <- one clean win of four
+```
+
+`housing_21` is the clearest case: a runaway hallucination that emits eight spurious flight searches
+in an apartment-search episode still outscores a model that asked one clarifying question, because it
+matched `search_apartments` once.
+
+**Conclusion, and why this closes the thread.** The container is not misconfigured and the research
+path is not better; the two paths sit at different points on an eagerness/caution trade-off, and
+FDB-v3's headline metric is scored on the axis that rewards eagerness. This finally makes the card's
+own two rows coherent: **82.5 % selection against 44.2 % argument accuracy** is the signature of a
+system that fires tool names readily and gets their arguments wrong, and **our 71.7 % / 50.7 %** is
+the signature of a more cautious one. Both rows are consistent with the same weights behind different
+orchestration, which is the most that released artifacts can establish. Two of the card's three
+metrics reproduce, the third is characterised down to its mechanism, and the numbers are accepted as
+measured.
 
 ## 5. Latency, measured 2026-08-21
 
