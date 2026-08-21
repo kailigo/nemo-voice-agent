@@ -63,6 +63,18 @@ ENV_PREFIX=/fsx/home/kai.li/miniforge3/envs/voicechat
 RUN="${RUN_NAME:-stage2_subset}"
 CAP_SECONDS="${CAP_SECONDS:-200}"
 NGPU="${NGPU:-8}"
+# Two allocations, one run. Local slot k takes global slot (SLOT_OFFSET + k) of TOTAL_SLOTS,
+# so 24 episodes split as 8 slots here (SLOT_OFFSET=0) and 8 on a second node
+# (SLOT_OFFSET=8, TOTAL_SLOTS=16) with no overlap -- 1-2 episodes per GPU instead of 3, which
+# is the difference between ~2 h and ~3-4 h of wall clock.
+#
+# Keep RUN the same on both nodes: --save-to is "$RUN/<domain>__<task>", one directory per
+# episode, so both nodes populate one run that tau2_merge_results.py reads in a single pass.
+# Give each node its own LOGDIR, or the two progress.log files collide -- and the truncation
+# below would wipe the other node's record, which is exactly the "7 OKs counted twice" bug
+# the comment there warns about.
+SLOT_OFFSET="${SLOT_OFFSET:-0}"
+TOTAL_SLOTS="${TOTAL_SLOTS:-$NGPU}"
 STAGGER_SECONDS="${STAGGER_SECONDS:-20}"
 LOGDIR="${LOGDIR:-$HERE/../logs/$RUN}"
 
@@ -113,7 +125,15 @@ PY
 fi
 
 N_JOBS=$(wc -l <"$JOBS")
-echo "stage 2: $N_JOBS episodes over $NGPU GPUs, cap ${CAP_SECONDS}s, logs in $LOGDIR"
+MINE=0
+for ((s = 0; s < NGPU; s++)); do
+  for ((j = 0; j < N_JOBS; j++)); do
+    ((j % TOTAL_SLOTS == SLOT_OFFSET + s)) && MINE=$((MINE + 1))
+  done
+done
+echo "stage 2: $MINE of $N_JOBS episodes on this node ($NGPU GPUs, global slots" \
+     "$SLOT_OFFSET..$((SLOT_OFFSET + NGPU - 1)) of $TOTAL_SLOTS), cap ${CAP_SECONDS}s," \
+     "logs in $LOGDIR"
 
 # --- fan out ----------------------------------------------------------------
 # Static round-robin (job i -> GPU i % NGPU) rather than a work queue. 24 jobs over 8 GPUs
@@ -130,7 +150,7 @@ for ((slot = 0; slot < NGPU; slot++)); do
     sleep $((slot * STAGGER_SECONDS))
     i=0
     while IFS=$'\t' read -r domain task_id; do
-      if ((i % NGPU != slot)); then
+      if ((i % TOTAL_SLOTS != SLOT_OFFSET + slot)); then
         i=$((i + 1))
         continue
       fi
@@ -178,6 +198,7 @@ done
 N_OK=$(grep -c ' OK ' "$LOGDIR/progress.log" || true)
 N_FAIL=$(grep -c ' FAIL ' "$LOGDIR/progress.log" || true)
 N_INFRA=$(grep -c ' INFRA ' "$LOGDIR/progress.log" || true)
-echo "stage 2 fan-out finished: ${N_OK:-0} ok, ${N_INFRA:-0} infra, ${N_FAIL:-0} failed, of $N_JOBS"
+echo "stage 2 fan-out finished: ${N_OK:-0} ok, ${N_INFRA:-0} infra, ${N_FAIL:-0} failed," \
+     "of $MINE on this node ($N_JOBS in the run)"
 echo "Merge with: scripts/tau2_merge_results.py --run $RUN"
 exit "$FAILED"
