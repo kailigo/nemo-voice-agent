@@ -381,6 +381,7 @@ Status board at 08:10:
 | signed per-turn latency | **done** | `scripts/fdb_v3_signed_latency.py` |
 | A4 live `nemo_rt` check | **done — works on mock, blocked on retail** | `tau-voice-2/logs/nemo_rt_live_check_*.json` |
 | A4b prompt-budget sweep | **done, 15 domains** | `tau-voice-2/logs/nemo_rt_prompt_budget.json` |
+| FDB-v3 discrepancy audit | **done — 11 suspects eliminated** | `FDB_V3_REPRODUCTION.md` §4 |
 | A5 concurrency probe | not started | — |
 | B1 Parakeet ASR pass | **done, 100/100, 0 failures** | `logs/fdb_v3/asr_nemo_rt.log` |
 | B2 re-score with latency | **done** | `logs/fdb_v3/eval_nemo_rt_withlatency.log` |
@@ -658,6 +659,14 @@ must not be re-quoted from a patched server. **This is Kai's call, not mine (see
    numbers were measured under**), compress the tool-schema serialization, or restrict arm C to
    `mock`/`banking`/`healthcare` and accept that it stops being comparable to arms A and B on
    retail. I did not pick one.
-6. Whether the Tool Selection gap being ~11 pts on *both* prompt branches (§6b A3) is worth another
-   hypothesis or worth reporting as-is. The prompt is ruled out; the remaining suspects are the
-   checkpoint (`stt_extracted_lora` vs whatever the card measured) and the audio front end.
+6. ~~Whether the Tool Selection gap being ~11 pts on *both* prompt branches (§6b A3) is worth another
+   hypothesis or worth reporting as-is.~~ **Answered by the discrepancy audit** —
+   `FDB_V3_REPRODUCTION.md` §4, "The discrepancy audit". Eleven suspects measured and eliminated,
+   including the two named here: the checkpoint is provably the released one (0 keys unique either
+   way, 1 differing value) and the audio front end is faithful (24 kHz per `api-reference.md:131`,
+   ASR-quality-vs-accuracy flat across WER quartiles). The gap decomposes into ~5.6 pts of spurious
+   cross-domain tool firing plus ~5.2 pts of recall shortfall, entirely inside the 30 `hard`
+   scenarios; easy and medium are at card level once over-firing is removed. **The one decision left
+   for Kai: whether to ask NVIDIA whether the card's FDB-v3 row was measured through this container
+   at all.** The public harness has no NVIDIA provider, so that question cannot be settled from
+   released artifacts.

@@ -13,6 +13,13 @@ This document is the audit trail for reproducing them with the released checkpoi
 benchmark actually requires, which parts of the published pipeline we run unchanged, which we
 replaced and why, and what the numbers came out to.
 
+**Where it landed:** Pass@1 reproduces (35.0 % vs 33 %), argument accuracy is not comparable because
+the judge differs, and Tool Selection is 10.8 points short. Eleven candidate deployment discrepancies
+were measured and eliminated — see [the discrepancy audit](#the-discrepancy-audit-2026-08-21--eleven-suspects-eliminated-and-where-the-11-points-are).
+The gap is half spurious tool firing, half recall shortfall, and all of it in the 30 `hard`
+scenarios. The public harness contains no NVIDIA provider, so the integration behind 82.5 % cannot be
+diffed against ours.
+
 Benchmark checkout: `/fsx/home/kai.li/code/Full-Duplex-Bench/v3` (unmodified — nothing in
 this reproduction edits it).
 
@@ -315,16 +322,111 @@ is already present by default and that we now know does not drive the gap.
 The honest statement, updated: **Pass@1 reproduces on the default branch (35.0 % vs 33.0 %) and
 falls below on the clean one (31.0 %); argument accuracy is not comparable in either arm because the
 judge differs; and Tool Selection is 9.4–11.7 points short on both prompt branches, which rules out
-the prompt as the explanation.** What remains untested is the harness itself — tool-call extraction,
-the `instant` latency profile, and the trailing-silence convention — plus the possibility that the
-card's number was produced with a checkpoint or decode configuration the released container does not
-reproduce.
+the prompt as the explanation.** What remained untested at that point was the harness itself —
+tool-call extraction, the `instant` latency profile, and the trailing-silence convention — plus the
+possibility that the card's number was produced with a checkpoint or decode configuration the
+released container does not reproduce. All of that is the subject of the audit below.
 
 One incidental finding: `ecommerce_20_66c4f3cb14cbfc4db836bd4e`, described above as a
 **deterministic** backend failure that survived three retries, **completed cleanly on the jinja
 branch** with three sensible calls. So that crash is prompt-dependent, not a fixed property of the
 released Triton backend. The jinja arm also has zero silent episodes, against two on the default
 branch.
+
+### The discrepancy audit, 2026-08-21 — eleven suspects eliminated, and where the 11 points are
+
+The prompt arm ruled out one explanation and left the gap unattributed. Rather than accept it, every
+difference we could find between the card's suggested setup and our deployment was checked. Each row
+below is a measurement, not a reading of the docs.
+
+| suspect | verdict | evidence |
+| --- | --- | --- |
+| Checkpoint provenance — Triton repo not built from the released weights | eliminated | triton-model-repo config vs released `voicechat-11b` config: **0** keys unique to either side, exactly **1** differing value (`model.stt.model.pretrained_asr`: `None` vs `''`). Against `stt_extracted_lora`, 339/340 keys mismatch. It is the released checkpoint. |
+| Prompt branch / restraint text | eliminated | both arms run at n=100, 71.7 % and 70.8 % (§4 above). |
+| Trailing-silence convention (our 20 s vs FDB's 1.5 s) | eliminated | only **2 of 184** calls fall outside FDB's own capture window (`livekit_inference.py`: `target_samples = duration_sec × 24 kHz`, +1500 ms). Truncating to their window: 71.7 → 71.9 %, 70.8 → 70.8 %. |
+| LiveKit VAD / turn-detection layer we don't have | eliminated | `lk_agent_tool.py:413` is `AgentSession(llm=model, tools=tools)` — no `vad`, no `turn_detection`. There is no layer to be missing. |
+| Tool-result latency profile | eliminated | the per-scenario `latency_profile` field (normal 78 / fast 12 / slow 10) is **dead data — no code reads it**. Only the process-global `--latency` exists, default `instant` at `lk_agent_tool.py:52`, which is what we ran. |
+| Input sample rate | eliminated | we send 24 kHz, which is exactly `api-reference.md:131` ("Client input sample rate 24 kHz"; the server resamples to 16 kHz internally). |
+| ASR quality upstream of tool choice | eliminated | container-vs-Parakeet WER mean 0.21, p50 0.17. Tool Selection by WER quartile: 69.0 / 64.3 / 78.4 / 75.2 % — flat and non-monotone. Transcription is not what picks the tool. |
+| Tool schemas the model sees | eliminated | AST diff of `lk_agent_tool.py` against `fdb_v3_tools.build_tools()`: **12/12 tools identical** — names, descriptions, per-parameter descriptions from the `Args:` docstrings, and required-argument sets. Zero mismatches. |
+| Agent instructions | eliminated | `VoiceAgent.instructions` vs `extract_instructions()`: 1213 chars, **byte-identical**. |
+| Tool-result payloads fed back | eliminated | both sides call FDB's own `MockAPIRegistry` and return `json.dumps(result)`; we deliver it as `function_call_output`. Same bytes. |
+| Strict reject accounting penalising us (calls dropped for missing required args never enter `actual_tool_calls`) | eliminated, and the distinction is **empty** | **0** rejected calls and **0** unparseable-argument calls across both arms. Every call the model emitted was a valid tool name with all required arguments. Scoring leniently changes nothing: 71.7 → 71.7 %. |
+| Decode configuration | eliminated | container defaults are `LLM_TEMPERATURE=0.0`, `LLM_TOP_P=1.0`, `LLM_REPETITION_PENALTY=1.0` (`model.py:193-195`), and `infer/utils.py:186` short-circuits to `greedy_tokens` under exactly those values. Decoding is deterministic greedy — the gap is not sampling noise and there is no decode win available. |
+| Metric convention (the card scoring the same behaviour a different way) | eliminated | our multiset F1 reproduces the official evaluator exactly at 71.7 %. Alternatives, all at n=100: set F1 76.0, recall-multiset 77.8, precision 69.6, recall-set 78.3, set-coverage 72.0, exact-match 52.0, micro-pooled F1 69.5. Per-scenario instead of per-recording: first speaker 73.1, best-of-speakers 74.8. **82.5 % is above every one of them.** |
+
+**The structural finding, which limits how far any audit can go: the public FDB-v3 harness has no
+NVIDIA/Nemotron provider at all.** `lk_agent_tool.py::get_realtime_model()` supports grok,
+gpt_realtime, azure_openai, gemini2_5, gemini3_1 and ultravox — nothing else. The only `nvidia`
+string anywhere in v3 is the Parakeet ASR used for *scoring*. The README credits NTU with the
+benchmark and NVIDIA with "a collaborative research discussion and advisory role", so the integration
+that produced 82.5 % was never released. Our client is a reimplementation against the same tools,
+instructions, mock APIs and scorer; it cannot be diffed against theirs, because theirs is not public.
+
+#### Where the 11 points actually are
+
+With the plumbing eliminated, the shape of the gap is the answer. Split by how many calls a scenario
+expects:
+
+| expected calls | n | expected | actual | matched | recall | precision | mean F1 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 66 | 66 | 66 | 52 | 78.8 % | 78.8 % | 75.2 % |
+| 2 | 18 | 36 | **55** | 27 | 75.0 % | **49.1 %** | 60.8 % |
+| 3 | 16 | 48 | **63** | 37 | 77.1 % | **58.7 %** | 69.8 % |
+| all | 100 | 150 | 184 | 116 | 77.3 % | 63.0 % | 71.7 % |
+
+**Recall is flat** (78.8 / 75.0 / 77.1 %) — the model is not failing to chain calls, which was the
+obvious hypothesis and is wrong. Precision collapses instead: 184 calls against 150 expected, and the
+excess is concentrated exactly where chains are (2-call scenarios emit 1.53x the expected count). The
+arithmetic closes off one direction entirely: to reach F1 = 0.825 at our precision, recall would have
+to be **1.19** — impossible; at our recall, precision would have to be 0.884 against our 0.630.
+
+Classifying all 184 calls into mutually exclusive buckets (`scripts/fdb_v3_gap_anatomy.py`): 116
+matched an expected slot, **36 called a function the scenario never expects** (24 of them
+**cross-domain**), 20 were exact duplicates of an earlier call (same function *and* arguments, in only
+9 examples), 12 over-counted an expected function with new arguments. Duplicates are counted first, so
+a spurious call re-issued twice lands in the duplicate bucket; counting every never-expected call
+regardless of duplication gives 43, of which 31 are cross-domain. The
+spurious calls are not garbage — their arguments are scenario-grounded, which is what makes them
+diagnostic:
+
+```
+housing_18  t=21.4/29.4/37.0s  get_exchange_rate {"amount": 700,  "USD"->"EUR"}   x3
+housing_24  t=30.2/31.3/34.8s  get_exchange_rate {"amount": 1500, "USD"->"EUR"}   ("update my max price to 1500")
+ecommerce_23 t=15.8s           get_exchange_rate {"amount": 100,  "USD"->"EUR"}
+```
+
+No user in any of these scenarios mentions currency. `housing_24` says *"update my max price to 1500
+because I'm on a tighter budget"* and the model fired a currency conversion on the number it heard.
+`ecommerce_23` is titled **"Unsupported Tool (Refund) + Valid Requests"** — the user asks to "process
+a refund", no refund tool exists, and the model substituted the nearest money-shaped tool instead of
+declining. These are hallucinations, not mislabelled ground truth.
+
+Pricing them with an oracle that deletes every spurious and duplicate call while keeping recall:
+
+| | `nemo_rt` | `nemo_rt_jinja` |
+| --- | --- | --- |
+| as measured | 71.7 % | 70.8 % |
+| − exact duplicates | 73.2 % | 71.7 % |
+| − calls to never-expected functions | 75.4 % | 75.1 % |
+| − both (the oracle) | **77.3 %** | **76.0 %** |
+| oracle, by difficulty (easy / medium / hard) | 77.8 / **83.1** / 70.2 % | 75.0 / 83.5 / 68.6 % |
+
+So the 10.8-point gap is **two roughly equal halves**: ~5.6 points of spurious firing and duplicates,
+and ~5.2 points of residual recall shortfall that no precision fix touches. Both live in `hard`
+(n=30): 60.9 % as measured, still only 70.2 % under the oracle, while `medium` reaches 83.1 % — i.e.
+**on easy and medium scenarios we are at card level once over-firing is removed, and the entire
+residual is the 30 hard scenarios**, which are the disfluency-heavy multi-tool chains
+(`PAUSE`, `FILLER`, "Filler-Heavy Multi-Tool Chain", "Hesitant Three-Tool Chain").
+
+**Conclusion.** Eleven candidate deployment discrepancies were checked and eliminated with
+measurements; none of them accounts for the gap, and the remaining behaviour is a property of the
+served model on hard disfluent chains — over-firing tools it was never asked for, and missing about a
+quarter of the ones it was. The one difference that cannot be closed is not in our control: the
+integration behind the card's 82.5 % is not in the public repo, so no further diff against it is
+possible from released artifacts. Anything more would have to come from NVIDIA — specifically whether
+their FDB-v3 row was produced through this container at all, or through the research path with a
+different tool-call surface.
 
 ## 5. Latency, measured 2026-08-21
 
