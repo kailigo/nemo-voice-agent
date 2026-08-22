@@ -885,15 +885,40 @@ model's 12.5 frames/s (80 ms `frame_length`) puts all five within a few hundred 
 **What this means for the plan.** Arm C cannot be measured on `retail` or `airline` — the two
 canonical τ-bench domains — with the container as released, and `telecom` is out by 2.4x. The
 domains that work are `mock`, `banking` and `healthcare`, none of which is a τ-bench domain. Three
-ways out, in order of cost:
+ways out, in order of cost — **option 1 has since been taken, at no memory cost; see below**:
 
-1. **Raise the literal.** `load_utils.py:424` is patchable and `fdb_v3_serve.sh` already launches
-   with `--container-writable`; the underlying model is `nemotron_h` with
-   `max_position_embeddings=131072` (`triton-model-repo/nemotron-voicechat/1/nano-v2-vllm/config.json`),
-   so 6144 is a serving choice, not an architectural one. Costs KV/mamba cache memory — GPU 0 is
-   already at 126 GB of 143 GB with the current setting, so this needs measuring, not assuming.
-   **Caveat: it deviates from the released config, so the FDB-v3 numbers in
-   `FDB_V3_REPRODUCTION.md` must not be re-quoted from a patched server.**
+1. **Raise the literal. DONE, and it costs nothing — measured 2026-08-22.** `load_utils.py:424` is
+   patchable and `fdb_v3_serve.sh` already launches with `--container-writable`; the underlying
+   model is `nemotron_h` with `max_position_embeddings=131072`
+   (`triton-model-repo/nemotron-voicechat/1/nano-v2-vllm/config.json`), so 6144 is a serving
+   choice, not an architectural one.
+
+   `LLM_MAX_MODEL_LEN=32768 SERVE_GPU=7 scripts/fdb_v3_serve.sh 1403 jinja 9000` comes up clean and
+   logs:
+
+   ```
+   PATCHED: LLM backbone max_model_len 6144 -> 32768 (TTS left at 6144)
+   424:        max_model_len=32768,
+   457:            "max_model_len": 6144,
+   GPU KV cache size: 2,211,840 tokens
+   Maximum concurrency for 32,768 tokens per request: 67.50x
+   ```
+
+   **The memory worry above was unfounded**, and worth recording as a correction rather than
+   quietly deleting: vLLM sizes the KV cache from `gpu_memory_utilization`, not from
+   `max_model_len`. `max_model_len` is a *per-request ceiling*, so raising it 5.3x allocates
+   nothing extra — 2.2 M cached tokens is 67x the new window. `max_num_batched_tokens=768` was
+   already below 6144, so chunked prefill was on before the patch and stays on.
+
+   `retail` now runs: 2,019 ticks (~400 s of audio) into task 7 with **zero** WS 1011s, against 5
+   of 5 zero-tick `infrastructure_error`s unpatched. Only line 424 is touched; 457 is the TTS
+   model and stays at 6144. The sed is anchored to match exactly once and the server refuses to
+   start otherwise, because a silent no-op here would read as "the window was raised" and
+   invalidate everything measured after it.
+
+   **Caveat, undiminished: it deviates from the released config, so the FDB-v3 numbers in
+   `FDB_V3_REPRODUCTION.md` must not be re-quoted from a patched server.** Anything measured this
+   way is a separate arm (A′ / C′), not a correction to those.
 2. **Compress the domain prompt.** The tool schemas dominate — retail is 12,279 chars of tool JSON
    against 7,469 of policy — so a terser schema serialization buys more than editing the policy.
 3. **Run arm C only on the domains that fit**, and say so. Cheapest, and it makes arm C
