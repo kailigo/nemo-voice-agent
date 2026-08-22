@@ -152,6 +152,15 @@ echo "stage 2: $MINE of $N_JOBS episodes on this node ($NGPU GPUs, global slots"
 # the node that frees up first the low SLOT_OFFSET.
 declare -a WORKER_PIDS=()
 
+# Read the whole job list into memory BEFORE any srun runs. This is a correctness fix, not a
+# style preference. `srun` inherits and reads the worker's stdin, and with the loop written as
+# `while read ... done <"$JOBS"` that stdin IS the job list -- so the first srun drains the file
+# and `read` returns EOF on the next iteration. Every slot silently runs exactly one episode and
+# exits 0. That cost 9 of 24 episodes on the 2026-08-21 stage-2 launch (airline 46 and all 8
+# telecom) with both launchers reporting success. Also pass </dev/null to the child so it can
+# never consume this shell's stdin again. Same fix, same reasoning, as tau2_stage2_gapfill.sh.
+mapfile -t JOB_LINES <"$JOBS"
+
 for ((slot = 0; slot < NGPU; slot++)); do
   (
     # Desynchronise the slots. Every episode otherwise reaches its first user utterance within
@@ -159,28 +168,27 @@ for ((slot = 0; slot < NGPU; slot++)); do
     # rather than load-bearing, but it also spreads the ~79 GB model loads, and 20 s x 8 slots
     # costs 2.3 min of a multi-hour run.
     sleep $((slot * STAGGER_SECONDS))
-    i=0
-    while IFS=$'\t' read -r domain task_id; do
-      if ((i % TOTAL_SLOTS != SLOT_OFFSET + slot)); then
-        i=$((i + 1))
-        continue
-      fi
-      i=$((i + 1))
+    gpu=$((GPU_OFFSET + slot))
+    for i in "${!JOB_LINES[@]}"; do
+      ((i % TOTAL_SLOTS == SLOT_OFFSET + slot)) || continue
+      line="${JOB_LINES[i]}"
+      [[ -n "${line//[[:space:]]/}" ]] || continue
+      IFS=$'\t' read -r domain task_id <<<"$line"
 
       # Directory name must be filesystem-safe: telecom ids are not.
       slug=$(printf '%s' "$task_id" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)
       name="$RUN/${domain}__${slug}${NAME_SUFFIX}"
-      log="$LOGDIR/gpu$((GPU_OFFSET + slot))__${domain}__${slug}${NAME_SUFFIX}.log"
+      log="$LOGDIR/gpu${gpu}__${domain}__${slug}${NAME_SUFFIX}.log"
 
-      echo "[gpu $slot] START $domain $task_id" >>"$LOGDIR/progress.log"
+      echo "[gpu $gpu] START $domain $task_id" >>"$LOGDIR/progress.log"
       rc=0
-      TAU2_DOMAIN="$domain" "$HERE/tau2_smoke_nemo.sh" "$JOBID" "$((GPU_OFFSET + slot))" \
+      TAU2_DOMAIN="$domain" "$HERE/tau2_smoke_nemo.sh" "$JOBID" "$gpu" \
         --task-ids "$task_id" \
         --max-steps-seconds "$CAP_SECONDS" \
         --hallucination-retries 0 \
         --save-to "$name" \
         --log-level INFO \
-        "$@" >"$log" 2>&1 || rc=$?
+        "$@" >"$log" 2>&1 </dev/null || rc=$?
 
       # Exit 0 is NOT enough. An episode that dies in setup is recorded as an
       # INFRASTRUCTURE_ERROR simulation, excluded from the metrics panel, and the batch then
@@ -190,13 +198,13 @@ for ((slot = 0; slot < NGPU; slot++)); do
       # Deliberately does not abort the slot: the remaining episodes are independent, and a
       # partial stage 2 still answers the diagnostic question.
       if ((rc != 0)); then
-        echo "[gpu $slot] FAIL $domain $task_id rc=$rc (see $log)" >>"$LOGDIR/progress.log"
+        echo "[gpu $gpu] FAIL $domain $task_id rc=$rc (see $log)" >>"$LOGDIR/progress.log"
       elif grep -q "failed permanently after" "$log"; then
-        echo "[gpu $slot] INFRA $domain $task_id (see $log)" >>"$LOGDIR/progress.log"
+        echo "[gpu $gpu] INFRA $domain $task_id (see $log)" >>"$LOGDIR/progress.log"
       else
-        echo "[gpu $slot] OK $domain $task_id" >>"$LOGDIR/progress.log"
+        echo "[gpu $gpu] OK $domain $task_id" >>"$LOGDIR/progress.log"
       fi
-    done <"$JOBS"
+    done
   ) &
   WORKER_PIDS+=($!)
 done
@@ -211,5 +219,16 @@ N_FAIL=$(grep -c ' FAIL ' "$LOGDIR/progress.log" || true)
 N_INFRA=$(grep -c ' INFRA ' "$LOGDIR/progress.log" || true)
 echo "stage 2 fan-out finished: ${N_OK:-0} ok, ${N_INFRA:-0} infra, ${N_FAIL:-0} failed," \
      "of $MINE on this node ($N_JOBS in the run)"
+
+# Dispatch accounting. ok+infra+failed summing to less than $MINE is the signature of the
+# stdin-drain bug above, and it is the ONLY signal that catches it: every worker exits 0 and the
+# summary line reads as a clean run. Coverage is the verdict, not the exit code.
+N_START=$(grep -c ' START ' "$LOGDIR/progress.log" || true)
+if ((${N_START:-0} != MINE)); then
+  echo "WARNING: dispatched ${N_START:-0} of $MINE episodes -- $((MINE - ${N_START:-0})) were" \
+       "NEVER STARTED. Do not treat this run as covering its episode list; diff the list" \
+       "against $LOGDIR/progress.log and re-run the remainder." >&2
+  FAILED=1
+fi
 echo "Merge with: scripts/tau2_merge_results.py --run $RUN"
 exit "$FAILED"
