@@ -67,10 +67,40 @@
 # matter -- but if sessions still die at exactly 300 s after raising MAX_SESSION_DURATION,
 # that is the next suspect and it needs a sed.
 #
+# MAX_DECODER_STEPS: the THIRD silent truncation gate, and the one that survives both fixes
+# above. Found on 2026-08-22: with max_model_len=65536 and MAX_SESSION_DURATION=1300, retail
+# task 7 still died -- this time at 417 s, with WS 1011 rather than 1006, and the real cause
+# only in the server log:
+#
+#   ERROR - Client ec68930e: Error processing audio:
+#           [500] Sequence 2873630666 exceeded max decoder steps (5000)
+#
+# 5000 steps / 417 s = 12.0 steps per second, i.e. the model's ~12.5 Hz frame rate: the cap is
+# 5000 AUDIO FRAMES, so a session ends after ~400 s of conversation no matter what
+# MAX_SESSION_DURATION says. tau-voice caps episodes at 1200 s, which needs ~15000 steps.
+#
+# Note this presents as 1011 "Internal server error" -- the SAME client-side code as the
+# max_model_len gate -- so 1011 does not identify which gate fired. Only the server log does.
+#
+# The cap is not a constant but a TENSOR SHAPE: `buffer_capacity =
+# seq_state.generated_text_tokens.shape[1]` (model.py:575, :627, :1429, :1520, :1785), read
+# back from the four buffers preallocated in `sequence_manager.py:43-47`. So patching those
+# four literals lifts all six checks at once, and `steps_exhausted` (data_types.py:87) is only
+# ever latched from that same comparison rather than being an independent limit.
+#
+# Unlike max_model_len this DOES allocate, because the buffers are preallocated per sequence --
+# but it is (steps x (3 + num_quantizers) x 8 bytes), so 5000 -> 20000 costs about 1-4 MB per
+# session. Irrelevant next to the ~127 GB the server already holds.
+#
+# The sed anchor `, 5000,` was verified to occur exactly 4 times in sequence_manager.py and
+# nowhere else in the backend; as with max_model_len it refuses to start on a miscount, because
+# a silent no-op here reads as "the cap was raised" and every later episode would die at 400 s
+# and score as a genuine agent failure.
+#
 # Usage: scripts/fdb_v3_serve.sh <jobid> [jinja|default] [port]
 #        LLM_MAX_MODEL_LEN=32768 scripts/fdb_v3_serve.sh 1374 jinja 9000
-#        LLM_MAX_MODEL_LEN=65536 MAX_SESSION_DURATION=1300 SERVE_GPU=7 \
-#          scripts/fdb_v3_serve.sh 1403 jinja 9000
+#        LLM_MAX_MODEL_LEN=65536 MAX_SESSION_DURATION=1300 MAX_DECODER_STEPS=20000 \
+#          SERVE_GPU=7 scripts/fdb_v3_serve.sh 1403 jinja 9000
 set -euo pipefail
 
 JOBID="${1:?usage: fdb_v3_serve.sh <jobid> [jinja|default] [port]}"
@@ -78,6 +108,7 @@ MODE="${2:-jinja}"
 PORT="${3:-9000}"
 LLM_MAX_MODEL_LEN="${LLM_MAX_MODEL_LEN:-}"
 MAX_SESSION_DURATION="${MAX_SESSION_DURATION:-}"
+MAX_DECODER_STEPS="${MAX_DECODER_STEPS:-}"
 # Which GPU the server takes. Used to be a hardcoded 0, which is wrong whenever the node is
 # also running episodes: on 2026-08-22 job 1403 had GPUs 0-6 busy and only 7 free. Still one
 # server per node -- audio_server.py:48 hardcodes TRITON_URL to localhost:8000 and pyxis
@@ -126,5 +157,20 @@ exec srun --overlap --jobid="$JOBID" --nodes=1 --ntasks=1 \
       grep -n 'max_model_len' \"\$LU\"
     else
       echo 'UNPATCHED: released max_model_len=6144'
+    fi
+    SM=/opt/tritonserver/backends/nemotron-voicechat/sequence_manager.py
+    if [[ -n '$MAX_DECODER_STEPS' ]]; then
+      # Same no-op guard as above: 4 preallocated buffers, and buffer_capacity is read back
+      # from their shape, so all six decoder-step checks follow from this one sed.
+      n=\$(grep -c ', 5000,' \"\$SM\") || n=0
+      if [[ \"\$n\" != 4 ]]; then
+        echo \"REFUSING TO START: expected exactly 4 ', 5000,' in \$SM, found \$n\" >&2
+        exit 5
+      fi
+      sed -i 's/, 5000,/, $MAX_DECODER_STEPS,/g' \"\$SM\"
+      echo \"PATCHED: max decoder steps 5000 -> $MAX_DECODER_STEPS (~\$(( $MAX_DECODER_STEPS / 12 )) s of audio at 12 Hz)\"
+      grep -n '$MAX_DECODER_STEPS' \"\$SM\"
+    else
+      echo 'UNPATCHED: max decoder steps 5000 -- sessions WILL die at ~400 s of audio with WS 1011'
     fi
     /s2s/run_s2s_server.sh"
