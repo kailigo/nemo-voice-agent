@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
-# Append a one-line status snapshot for every live tau-voice arm, every $INTERVAL seconds.
+# Append a status snapshot for every live tau-voice arm, every $INTERVAL seconds.
 #
 # Exists because the interactive shell times out at 2 minutes but these arms run for hours, so
 # polling from the foreground either blocks or samples too coarsely to catch a transition. This
-# runs detached and leaves a timeline on disk that can be read in one cheap call.
+# runs detached and leaves a timeline on disk that can be read back in one cheap call.
 #
 # It records COVERAGE (episode records written), not exit status: a tau-voice batch reports
 # success and exits 0 even when every episode inside it died in setup, so the count of saved
 # records is the only honest progress signal.
+#
+# Counting trap: episode records are `<run>/<subdir>/simulations/<uuid>.json`, but `find -path
+# '*/simulations/*.json'` ALSO matches the `data/simulations/` prefix shared by every run, which
+# silently doubles the count and made a 14-episode arm read as 28. Anchor on the UUID filename.
+#
+# Process trap: arm A's clients run inside srun steps on the compute node, so pgrep on the login
+# node sees only the srun wrappers (2 per episode) and never the python client. Count the
+# wrappers and halve, or just treat >0 as "alive" -- do not read it as an episode count.
 #
 # Usage: setsid nohup scripts/watch_runs.sh > logs/watch.log 2>&1 </dev/null & disown
 set -uo pipefail
@@ -21,16 +29,19 @@ OUT="${OUT:-$HERE/../logs/run_timeline.tsv}"
 RUNS=(
   "stage2_subset_0821:24"
   "gemini_baseline_0821b:16"
-  "nemo_rt_0822b:5"
+  "nemo_rt_0822c:5"
 )
 
+# The arm A' client log and the container log currently under test.
+RT_LOG="${RT_LOG:-$HERE/../logs/nemo_rt_0822c/retail.log}"
+SRV_LOG="${SRV_LOG:-$HERE/../logs/nemo_rt_serve_0822_v3.log}"
+
 count_records() {
-  # UUID-named files are per-simulation records; results.json / sim_status.json are not.
   find "$TAU2/data/simulations/$1" -name '*-*-*-*-*.json' 2>/dev/null | wc -l
 }
 
 if [[ ! -s "$OUT" ]]; then
-  printf 'ts\trun\trecords\ttarget\tprocs\tnote\n' >"$OUT"
+  printf 'ts\twhat\tvalue\tnote\n' >"$OUT"
 fi
 
 while :; do
@@ -38,33 +49,33 @@ while :; do
 
   for entry in "${RUNS[@]}"; do
     run="${entry%%:*}"; target="${entry##*:}"
-    n=$(count_records "$run")
-    printf '%s\t%s\t%s\t%s\t-\t-\n' "$ts" "$run" "$n" "$target" >>"$OUT"
+    printf '%s\t%s\t%s/%s\t-\n' "$ts" "$run" "$(count_records "$run")" "$target" >>"$OUT"
   done
 
-  # arm A' is the one with a live gate to watch: ticks should keep climbing and the two
-  # truncation signatures should stay at zero.
-  rt_log="$HERE/../logs/nemo_rt_0822b/retail.log"
-  if [[ -f "$rt_log" ]]; then
-    ticks=$(grep -c 'Agent audio' "$rt_log" 2>/dev/null || echo 0)
-    sess=$(grep -c 'session configured' "$rt_log" 2>/dev/null || echo 0)
-    retry=$(grep -icE 'code=1006|failed \(attempt' "$rt_log" 2>/dev/null || echo 0)
-    calls=$(grep -icE 'FunctionCall|function_call|tool_call' "$rt_log" 2>/dev/null || echo 0)
-    printf '%s\tnemo_rt_0822b\t-\t-\t-\tticks=%s sessions=%s retries=%s toolcalls=%s\n' \
-      "$ts" "$ticks" "$sess" "$retry" "$calls" >>"$OUT"
+  # arm A' is the one with live gates to watch: ticks must keep climbing PAST 2000 (the old
+  # 5000-decoder-step wall sat at ~2085 ticks) and the failure signatures must stay at zero.
+  if [[ -f "$RT_LOG" ]]; then
+    ticks=$(grep -c '^Tick ' "$RT_LOG" 2>/dev/null || echo 0)
+    sess=$(grep -c 'session configured' "$RT_LOG" 2>/dev/null || echo 0)
+    fail=$(grep -cE 'code=10[0-9][0-9]|failed \(attempt' "$RT_LOG" 2>/dev/null || echo 0)
+    calls=$(grep -cE 'FunctionCall|function_call|tool_call' "$RT_LOG" 2>/dev/null || echo 0)
+    printf '%s\tnemo_rt_client\t-\tticks=%s sessions=%s failures=%s toolcalls=%s\n' \
+      "$ts" "$ticks" "$sess" "$fail" "$calls" >>"$OUT"
   fi
 
-  srv="$HERE/../logs/nemo_rt_serve_0822_v2.log"
-  if [[ -f "$srv" ]]; then
-    cuts=$(grep -c 'Session audio duration limit reached' "$srv" 2>/dev/null || echo 0)
-    printf '%s\tcontainer\t-\t-\t-\tsession_cuts=%s\n' "$ts" "$cuts" >>"$OUT"
+  # The three container gates, each with its own server-side signature. The client sees WS 1011
+  # for BOTH max_model_len and the decoder-step cap, so only these lines identify which fired.
+  if [[ -f "$SRV_LOG" ]]; then
+    cuts=$(grep -c 'Session audio duration limit reached' "$SRV_LOG" 2>/dev/null || echo 0)
+    steps=$(grep -c 'exceeded max decoder steps' "$SRV_LOG" 2>/dev/null || echo 0)
+    ctx=$(grep -cE 'longer than the maximum model length|exceeds the maximum' "$SRV_LOG" 2>/dev/null || echo 0)
+    printf '%s\tcontainer\t-\tsession_cuts=%s decoder_steps=%s ctx_overflow=%s\n' \
+      "$ts" "$cuts" "$steps" "$ctx" >>"$OUT"
   fi
 
-  # Live episode processes, per arm, so a stall is distinguishable from a finish.
-  for pat in "audio-native-provider nemo " "audio-native-provider nemo_rt" "audio-native-provider gemini"; do
-    c=$(pgrep -fc "$pat" 2>/dev/null || echo 0)
-    printf '%s\tprocs\t-\t-\t%s\t%s\n' "$ts" "$c" "$pat" >>"$OUT"
-  done
+  printf '%s\tprocs\t-\tsrun_wrappers=%s rt_clients=%s\n' "$ts" \
+    "$(pgrep -fc 'srun --jobid=1403 --overlap' 2>/dev/null || echo 0)" \
+    "$(pgrep -fc 'audio-native-provider nemo_rt' 2>/dev/null || echo 0)" >>"$OUT"
 
   sleep "$INTERVAL"
 done
