@@ -46,14 +46,38 @@
 # per-request ceiling and 32768 is far inside it. `max_num_batched_tokens=768` is already
 # below 6144, so chunked prefill is on and stays on.
 #
+# MAX_SESSION_DURATION: the container closes any session after this many seconds of AUDIO and
+# the default is 300 (`audio_server.py:106`, `MAX_SESSION_DURATION = int(os.environ.get(...,
+# "300"))  # 5 minutes`). This is the SECOND silent truncation gate after max_model_len, and it
+# is the one that bit tau-voice on 2026-08-22: retail task 7 was cut at 300 s six times in a
+# row, mid-opening-exchange, and the client saw only `WebSocket closed unexpectedly
+# (code=1006)` with vLLM logging `Aborted request(s)` -- both of which read as a crash or a
+# network flake. The server-side line is the only honest signal:
+#
+#   Client d6aa7ae1: Session audio duration limit reached (300.0s >= 300s)
+#
+# tau-voice episodes are capped at 1200 s, so anything above ~4 minutes of conversation is
+# unmeasurable at the default. Unlike max_model_len this needs no source patch -- it is a
+# supported env var -- so set it above the tau-voice cap and let tau-voice's own
+# --max-steps-seconds be the only thing that ends an episode. A truncated episode is worse
+# than no episode: it scores as a real failure.
+#
+# Watch out for `timeout_keep_alive=300` (audio_server.py:1897), which is a hardcoded uvicorn
+# setting. It governs idle HTTP keep-alive rather than an active websocket, so it should not
+# matter -- but if sessions still die at exactly 300 s after raising MAX_SESSION_DURATION,
+# that is the next suspect and it needs a sed.
+#
 # Usage: scripts/fdb_v3_serve.sh <jobid> [jinja|default] [port]
 #        LLM_MAX_MODEL_LEN=32768 scripts/fdb_v3_serve.sh 1374 jinja 9000
+#        LLM_MAX_MODEL_LEN=65536 MAX_SESSION_DURATION=1300 SERVE_GPU=7 \
+#          scripts/fdb_v3_serve.sh 1403 jinja 9000
 set -euo pipefail
 
 JOBID="${1:?usage: fdb_v3_serve.sh <jobid> [jinja|default] [port]}"
 MODE="${2:-jinja}"
 PORT="${3:-9000}"
 LLM_MAX_MODEL_LEN="${LLM_MAX_MODEL_LEN:-}"
+MAX_SESSION_DURATION="${MAX_SESSION_DURATION:-}"
 # Which GPU the server takes. Used to be a hardcoded 0, which is wrong whenever the node is
 # also running episodes: on 2026-08-22 job 1403 had GPUs 0-6 busy and only 7 free. Still one
 # server per node -- audio_server.py:48 hardcodes TRITON_URL to localhost:8000 and pyxis
@@ -81,6 +105,12 @@ exec srun --overlap --jobid="$JOBID" --nodes=1 --ntasks=1 \
     unset PYTHONPATH LD_LIBRARY_PATH CONDA_PREFIX VIRTUAL_ENV
     export NIM_HTTP_API_PORT=$PORT CUDA_VISIBLE_DEVICES=$SERVE_GPU MODEL_REPOSITORY=/data/models
     export USE_JINJA_TEMPLATE_PROMPT=$USE_JINJA
+    if [[ -n '$MAX_SESSION_DURATION' ]]; then
+      export MAX_SESSION_DURATION=$MAX_SESSION_DURATION
+      echo \"SESSION CAP: \$MAX_SESSION_DURATION s of audio (container default is 300)\"
+    else
+      echo 'SESSION CAP: container default 300 s -- episodes longer than ~5 min WILL be cut'
+    fi
     LU=/opt/tritonserver/backends/nemotron-voicechat/checkpoint_utils/load_utils.py
     if [[ -n '$LLM_MAX_MODEL_LEN' ]]; then
       # Fail loudly on a no-op: if the anchor ever stops matching, the server would come up at
