@@ -102,8 +102,33 @@ Note the error shapes: `3RK2T9` → `3RGRK2T` inserts a character and duplicates
 plausible *airport-code plus number* shape. `retail__78` also shows the model does not know
 retail order ids carry a `#W` prefix.
 
-Homophone errors in ordinary words share the mode: `airline__40`, "change it from Mei Lee to
-Mei Garcia" → the model sent `first_name: "May"`.
+**The audio is not the problem — measured 2026-08-22, `scripts/mode_a_probe.py` readout 0.**
+Parakeet TDT 0.6b, run over the *same* `both.wav` user channel the model heard (cut to the
+labelled turn, no re-synthesis), recovered **4 of 4** ids exactly:
+
+| episode | expected | independent ASR heard | model sent | model edit distance |
+|---|---|---|---|---|
+| `airline__28` | `SI5UKW` | `SI5UKW` | `SIN-555` | 4 |
+| `airline__3` | `anya_garcia_5901` | `Anya underscore Garcia underscore 5901` | `JFK59001` | 11 |
+| `airline__40` | `3RK2T9` | `3RK2T9` | `3RGRK2T` | 3 |
+| `retail__78` | `#W5056519` | `W5056519` | `WDL500019` | 5 |
+
+A 0.6b ASR reads every id off 8 kHz G.711 telephony audio, and even renders them in canonical
+form. So the ids are fully present in the signal and mode A is **inside our model**. Two
+consequences:
+
+* **Retract the telephony explanation.** §5.1 and the FDB-v3 comparison listed "8 kHz µ-law
+  vs FDB-v3's 24 kHz clean" as a factor compounding mode A. It is not one for these four
+  receipts. Bandwidth augmentation is not the SFT fix; the information was there.
+* This does **not** yet separate our speech encoder from our LLM — Parakeet is not our
+  encoder, so this only proves recoverability. Readouts 1–3 in the probe's docstring
+  (reproduce / perceive / copy) are what localise it, and they need the 11B.
+
+**Homophones are a genuine exception and should be split out of this mode.** On `airline__40`
+the model sent `first_name: "May"` for "Mei"; Parakeet independently produced *"from May Lee
+to May Garcia"* on the same audio. That error is inherent ambiguity in the signal, not our
+defect, and unlike the spelled ids no amount of copy-fidelity training fixes it — only
+context ("Mei" is the name already on the reservation) does.
 
 ### Mode B — the value goes into the wrong argument slot (3/14)
 
@@ -336,13 +361,25 @@ Ranked by (episodes blocked) × (confidence the mode is real).
 
 ## 7. Open questions
 
-* **Is mode A an encoder error or an LLM error?** Unresolved and it decides what the
-  training data looks like. The model is end-to-end duplex (speech encoder
-  `nvidia/nemotron-speech-streaming-en-0.6b` feeding the LLM) and `user_transcript` is
-  `None` in every tick, so this cannot be separated from outside τ². Proposed probe: synthesize
-  the exact spelled ids from the failing episodes and drive the model directly, comparing what
-  the encoder produces against what the function channel emits. ~1 GPU, minutes. **Needs a
-  go-ahead — it changes the SFT recipe.**
+* **Is mode A an encoder error or an LLM error? Half answered.** Readout 0 is done
+  (`scripts/mode_a_probe.py`, §3 mode A): an independent ASR recovers 4/4 ids from the same
+  audio, so the failure is inside our model and the audio/codec explanation is retracted. What
+  is still open is **encoder vs copy**, which needs the 11B and the remaining three readouts:
+
+  | readout | condition | localises |
+  |---|---|---|
+  | 1 | real domain prompt, unchanged | does the failure reproduce? (**the gate** — greedy sampling, so it must) |
+  | 2 | "repeat the id back, call no tools" | did the encoder+LLM **perceive** it? |
+  | 3 | id supplied as text, no audio | can the LLM **copy** it into the slot at all? |
+
+  If 2 succeeds where 1 fails, perception is intact and the value is lost on the way into the
+  argument slot — which merges mode A into mode B and makes copy-fidelity supervision the fix,
+  not more spelled-id audio. Caveat on readout 2: it changes the prompt, and this checkpoint is
+  demonstrably prompt-sensitive, so it is evidence about perception rather than proof about
+  that episode.
+
+  The stimulus problem is solved and costs nothing: τ-voice persisted `both.wav` plus label
+  tracks per episode, so all readouts use the exact waveform that produced `SIN-555`.
 * **Does mode C survive when the id *is* supplied cleanly?** i.e. is it a grounding failure
   or a policy failure ("always fill the slot")?
 * **Telecom is entirely unmeasured** — 0 of the subset's 8 telecom episodes have run on
