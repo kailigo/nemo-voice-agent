@@ -31,20 +31,35 @@
 #
 # So this arm tests one thing: how much of arm A's 0-of-14 is the path.
 #
-# BLOCKED ON retail/airline/telecom AS THE CONTAINER IS RELEASED. Tried 2026-08-21 and it
-# reproduced the wall TAU_VOICE_SFT_PLAN.md §0e-bis already measured: the LLM backbone is
-# launched with `max_model_len=6144` (`checkpoint_utils/load_utils.py:424`, a literal, not an
-# env var), and retail's prompt plus tool schemas tokenizes to 10978. The failure is
-# invisible from here -- `session.update` is ACKed, the server logs the instructions as
-# accepted, and then the FIRST AUDIO CHUNK closes the socket with WebSocket 1011 "Internal
-# server error", which reads exactly like a network flake. All 5 retail episodes came back
-# `infrastructure_error` with 0 ticks. Only `mock`, `banking` and `healthcare` complete, and
-# none of those is a tau-bench domain.
+# TWO CONTAINER GATES MUST BE RAISED FIRST, or this measures the gate and not the model.
+# Both truncate silently and both look like a network fault from the client. Launch the server
+# with BOTH knobs, via scripts/fdb_v3_serve.sh:
 #
-# Do not re-run this on retail/airline/telecom until the window is dealt with. The options
-# and their costs are in TAU_VOICE_SFT_PLAN.md §0e-bis; raising the literal deviates from the
-# released config, so anything measured that way must not be quoted alongside the FDB-v3
-# numbers in FDB_V3_REPRODUCTION.md.
+#   LLM_MAX_MODEL_LEN=65536 MAX_SESSION_DURATION=1300 SERVE_GPU=7 \
+#     scripts/fdb_v3_serve.sh <jobid> jinja 9000
+#
+# 1. `max_model_len=6144` (`checkpoint_utils/load_utils.py:424`, a literal, not an env var).
+#    retail's prompt plus tool schemas tokenizes to 10978, so the domain is refused outright:
+#    `session.update` is ACKed, the instructions are logged as accepted, and then the FIRST
+#    AUDIO CHUNK closes the socket with WS 1011. On 2026-08-21 all 5 retail episodes came back
+#    `infrastructure_error` with 0 ticks. Raising it costs nothing (vLLM sizes KV cache from
+#    gpu_memory_utilization, not from this) -- see TAU_VOICE_SFT_PLAN.md §0e-bis.
+#
+# 2. `MAX_SESSION_DURATION`, default 300 s (`audio_server.py:106`). This one is subtler and it
+#    invalidated the 2026-08-22 first attempt: retail task 7 ran fine, then was cut at 300 s of
+#    audio, six times in a row, retried to attempt 5 of 9. The client sees only WS 1006 and
+#    vLLM logs `Aborted request(s)`. The tell is the constant interval (5:14, 5:15, 5:14) and
+#    the server line `Session audio duration limit reached (300.0s >= 300s)`. Since tau-voice
+#    caps episodes at 1200 s, set this ABOVE that so tau-voice's own --max-steps-seconds is the
+#    only thing that ends an episode. It is a plain env var, no patch needed.
+#
+# A truncated episode is worse than no episode: it scores as a real failure, and the first
+# attempt's "the container never calls a tool" read was exactly that artifact -- one episode
+# cut six times in its opening exchange, mistaken for five completed episodes.
+#
+# Raising max_model_len deviates from the released config, so anything measured this way must
+# not be quoted alongside the FDB-v3 numbers in FDB_V3_REPRODUCTION.md, which were all taken
+# at 6144.
 #
 # NO GPU AND NO SRUN, on purpose. The container is already resident (fdb_v3_serve.sh pins
 # CUDA_VISIBLE_DEVICES=0 and holds ~127 GB); this is a websocket client that runs anywhere
