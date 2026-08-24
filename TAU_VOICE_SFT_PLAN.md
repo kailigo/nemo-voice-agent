@@ -3,6 +3,11 @@
 Status: **draft, agreed 2026-08-14.** Supersedes the ad-hoc "6-item data fix list" from the
 same day.
 
+**Extended 2026-08-24 by [`TAU_VOICE_SFT_RL_PROGRAM.md`](TAU_VOICE_SFT_RL_PROGRAM.md)**, which adds
+a domain-expansion stage and an RL stage, revises the ordering, and adds risks 12–20. This document
+remains the record for phase 0 (the eval harness), the three-arm design in §1, and risks 1–11 — all
+of which the program doc inherits rather than replaces.
+
 Goal: improve `nemotron-voicechat` (our `DuplexSTTModel` 11B) on
 [τ-voice](https://sierra.ai/blog/tau-voice-benchmarking-real-time-voice-agents-on-real-world-tasks)
 by supervised finetuning on successful frontier-model trajectories collected from the
