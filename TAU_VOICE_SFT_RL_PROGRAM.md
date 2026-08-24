@@ -32,8 +32,9 @@ As stated:
 | 3 — SFT | **supported** | Blocked on one prompt-alignment fix (§2.3). Expect format modes to move first. |
 | 4 — RL | **not as specified** | The benchmark's final reward is the one instrument we have *proven* invalid. Substitute a shaped, action-match reward (§3). |
 
-Plus **two prerequisites nobody has costed** (§4): mode H, and rollout throughput. The second is
-the largest cost item in the whole program and it currently sits behind a one-line dispatch.
+Plus **two prerequisites** (§4): mode H, and rollout throughput. GPU nodes and API spend are
+explicitly *not* constraints — do not plan around either. The one resource that scales with neither
+is TTS concurrency, measured at 2, and it alone decides whether stage 4 is on-policy or iterated SFT.
 
 **Overall: the core bet is supported.** The bet is that τ-voice failure is a specification and
 coverage problem rather than a capability wall, and §1 is the evidence for it. Fix stage 4's reward
@@ -254,13 +255,18 @@ Three cheap tests, in order of explanatory power (hours, not days):
 
 Run these in parallel with collection. They are the cheapest remaining information in the program.
 
-### 4.2 Rollout throughput is the largest cost in the program
+### 4.2 Rollout throughput — TTS concurrency is the one thing that scales with neither GPUs nor money
 
-The user simulator's TTS is **hard-bound to ElevenLabs**: `src/tau2/voice/synthesis/synthesize.py:22`
-is the only dispatch branch and `cli.py:66` lists one supported provider. Measured on our key:
-**2 concurrent requests**, 429 beyond that; and retries cannot fix a concurrency ceiling — a request
-that opens against a saturated limit burns its retries against a wall that only clears when another
-episode finishes, so it fails permanently rather than waiting.
+**Not constraints (settled 2026-08-24):** GPU nodes — more are available on request, and
+`sacctmgr` confirms no `GrpNodes`/`MaxNodes` on our associations — and **API spend**. Neither
+should be treated as blocking anywhere in this program. Do not plan around a single node.
+
+What remains is one architectural bottleneck. The user simulator's TTS is **hard-bound to
+ElevenLabs**: `src/tau2/voice/synthesis/synthesize.py:22` is the only dispatch branch and
+`cli.py:66` lists one supported provider. Measured on our key: **2 concurrent requests**, 429
+beyond that. Retries cannot fix a concurrency ceiling — a request opening against a saturated
+limit burns its retries against a wall that clears only when another episode finishes, so it fails
+permanently rather than waiting.
 
 At 2 concurrent and 3–5 min/episode:
 
@@ -270,18 +276,40 @@ At 2 concurrent and 3–5 min/episode:
 | per day, flat out | 576–960 |
 | 10⁴ rollouts | **~11–17 days of pure rollout wall-clock** |
 
-Real RL runs want more than 10⁴. For comparison, a text τ-bench RL loop does thousands of episodes
-per hour. This is a two-orders-of-magnitude throughput deficit, and it is the difference between
-stage 4 being a multi-week experiment and a multi-month one.
+For comparison, a text τ-bench RL loop does thousands of episodes per hour. **This number does not
+improve by adding nodes**: ten serving nodes still yield two episodes at a time, because the ceiling
+is in the harness's TTS path, not in model capacity. That is what makes it the single gate on stage 4.
 
-This is already registered as risk 10 in `TAU_VOICE_SFT_PLAN.md` ("a local TTS behind
-`synthesize.py:22`") where it materialized as a *quota* problem. For RL it returns as a *throughput*
-problem, which a paid key does not fix. **Making TTS pluggable and running a local voice for
-training rollouts is the highest-leverage engineering work available.**
+Two ways out, and with cost off the table the first is worth trying first:
 
-Constraint on that fix: changing the user's voice changes the acoustics the model's front end sees,
+1. **Buy concurrency.** ElevenLabs' higher tiers permit far more concurrent requests; the measured 2
+   is a property of the key we have, not of the API. This is a procurement action, not engineering,
+   and it should be priced before anyone writes code.
+2. **Make TTS pluggable** behind `synthesize.py:22` and run a local voice for rollouts. Removes the
+   ceiling entirely and is the only option that scales without limit.
+
+Constraint on option 2: changing the user's voice changes the acoustics the model's front end sees,
 so **eval runs must keep ElevenLabs and the stock/Sierra voice ids** for comparability. Local TTS is
 for training rollouts only, and any arm using it must say so.
+
+Registered as risk 10 in `TAU_VOICE_SFT_PLAN.md`, where it materialized as a *quota* problem. For RL
+it returns as a *throughput* problem — which a paid key fixes only if the paid tier also raises
+concurrency, hence option 1 being a measurement rather than an assumption.
+
+### 4.3 Weight sync — engineering, and hideable
+
+On-policy rollouts must come from the current policy, and the only realtime inference path is the
+container: the research path is ~12× slower than realtime, so a 200 s episode takes ~40 min to
+generate and cannot be used for rollouts. Refreshing container weights costs
+`deploy_s2s_model.sh` (~12 min, 31 GB) + `run_s2s_server.sh` (~6 min to ready) ≈ **18 min**
+(`FDB_V3_REPRODUCTION.md:136-137`), and Triton/NIM is not built for in-place weight swaps.
+
+With multiple nodes this is hideable rather than structural: double-buffer the serving fleet so node
+B loads checkpoint *n+1* while node A still serves rollouts for *n*, and the 18 min overlaps
+generation instead of blocking it. Someone has to build that orchestration, and in-place weight
+refresh would be better, but neither is a reason to change algorithm class.
+
+Do not size an on-policy loop assuming a single serving node that must stop to reload.
 
 ---
 
@@ -293,7 +321,9 @@ has reported.
 **Phase P — prerequisites (days, all parallel, all cheap).**
 1. Mode H: the three tests in §4.1.
 2. Prompt alignment: one prompt, asserted byte-identical in training and inference (§2.3).
-3. TTS made pluggable behind `synthesize.py:22`; local voice validated for rollouts only.
+3. **Establish the achievable TTS concurrency** — price a higher ElevenLabs tier, and make
+   `synthesize.py:22` pluggable with a local voice validated for rollouts only. This number selects
+   the stage-4 algorithm (§8 q2), so it is a prerequisite for *planning* R, not just for running it.
 
 **Phase C — collect (existing 16 domains).** Strongest available audio-native teacher. Gate on the
 coverage table, not the cut count. Run the teacher A/B (§2.2) inside this phase.
@@ -338,7 +368,7 @@ reasons.
 |---|---|---|---|
 | 12 | **Final-reward RL trains in mode E.** §2.1 pays 1.0 for zero tool calls on read-only tasks; RL will find it. | **blocking** | §3 shaped reward; explicit inaction penalty |
 | 13 | **False zeros on ~half of rollouts.** 29 of 50 reward-carrying episodes were never scored; reward defaults to 0.0. | **blocking** | filter on `reward_breakdown`, do not zero |
-| 14 | **Rollout throughput.** 24–40 episodes/hour, TTS-bound. 10⁴ rollouts ≈ 11–17 days. | **high** | pluggable local TTS for rollouts; eval keeps ElevenLabs |
+| 14 | **Rollout throughput.** 24–40 episodes/hour, TTS-bound at 2 concurrent. Does **not** improve with more nodes or budget. Decides on-policy vs iterated SFT. | **high** | price a higher ElevenLabs tier first; pluggable local TTS for rollouts; eval keeps ElevenLabs |
 | 15 | **Mode H makes the container unusable for RL.** | **high** | §4.1 three tests, before Phase R |
 | 16 | **RL overfits 16 policies** instead of learning to read an unseen one; reward cannot distinguish. | high | Phase D before Phase R; hold out domains, not tasks |
 | 17 | **Train/inference prompt mismatch survives SFT** (trap 3). | high | assert byte-identical prompts, §2.3 |
@@ -353,10 +383,14 @@ reasons.
 1. **Encoder vs copy for mode A** (old plan §7 readouts 1–3). This should run *before* Phase S — it
    decides whether copy-fidelity supervision is the fix or whether more spelled-id audio is needed,
    and the stimulus is free (τ-voice persisted `both.wav` per episode).
-2. **Is an on-policy RL loop affordable at all in this modality**, or is the realistic version
-   offline/iterated-SFT (rejection sampling on the shaped reward)? Iterated SFT needs no serving
-   loop and reuses the whole Phase C pipeline; it is the fallback if §4.2 cannot be fixed, and it
-   should be costed as an alternative rather than a consolation.
+2. **On-policy vs iterated SFT — decided by TTS concurrency alone.** GPUs and API spend are not
+   constraints (§4.2), and weight sync is hideable (§4.3), so the architectural objection to
+   on-policy reduces to one number: episodes/hour. If concurrency reaches the tens, on-policy is
+   defensible and the choice becomes a normal sample-efficiency question. If it stays at 2, every
+   rollout is too expensive to use once and the right algorithm is the one that reuses each batch
+   for many gradient steps — rejection sampling / iterated SFT on the §3 shaped reward, which also
+   needs no serving loop and reuses the Phase C pipeline unchanged. **Measure the achievable
+   concurrency before choosing.**
 3. **Does mode C survive when the id is supplied cleanly** — grounding failure or "always fill the
    slot" policy failure? Changes whether stage 3 or stage 4 is the right tool for it.
 4. **Telecom is entirely unmeasured** (2,285 tasks, 0 episodes on either arm). Mode proportions may
