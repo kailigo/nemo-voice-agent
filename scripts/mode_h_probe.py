@@ -80,10 +80,13 @@ EXPECTED_BASELINE_CHARS = 7469  # what the server logged for the real arm-A' ses
 # emits it as `conversation.item.input_audio_transcription.delta` -- a "transcript" match would
 # fold the user's own words into what we score as the agent's reply.
 AGENT_TEXT = "response.output_audio_transcript.delta"
-USER_ASR = (
-    "conversation.item.input_audio_transcription.delta",
-    "conversation.item.input_audio_transcription.completed",
-)
+# Only the DELTA feeds `heard`. The `.completed` event repeats the whole turn's transcript, so
+# accumulating both made every user turn appear twice ("hellohellois anyone there?is anyone
+# there?") and read as if the container had double-processed the input. It had not; that was
+# this script. `.completed` is used as a turn boundary instead.
+USER_ASR_DELTA = "conversation.item.input_audio_transcription.delta"
+USER_ASR_DONE = "conversation.item.input_audio_transcription.completed"
+USER_ASR = (USER_ASR_DELTA, USER_ASR_DONE)
 TOOL_DONE = "response.function_call_arguments.done"
 
 # Refusal detector. A fixed list of literal strings was the first attempt and it FAILED on the
@@ -115,6 +118,33 @@ SAFETY_RE = re.compile(
     r"unauthorized (?:use|modification)",
     re.IGNORECASE,
 )
+
+
+def loop_stats(text: str, min_repeats: int = 3) -> dict:
+    """Does the transcript degenerate into one sentence emitted over and over?
+
+    THIS, not the refusal, is the mode-H phenomenon -- established 2026-08-24, when the real
+    7469-char prompt produced no refusal but still looped, and a 131-char benign prompt with no
+    domain policy looped too. The refusal was only *what* one server process happened to lock
+    onto; the loop is what kills every session. A probe that reports refusals alone therefore
+    calls a looping session clean, which is how the first reading of this script went wrong.
+
+    Counts the most frequent sentence rather than adjacency: the container interleaves the
+    repeated unit with occasional other output, so a strict "same sentence twice in a row" test
+    undercounts. Sentences under 12 chars are ignored -- "Hi!" recurs innocently.
+    """
+    units = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) >= 12]
+    if not units:
+        return {"looped": False, "repeats": 0, "unit": None}
+    counts: dict[str, int] = {}
+    for u in units:
+        counts[u] = counts.get(u, 0) + 1
+    unit, n = max(counts.items(), key=lambda kv: kv[1])
+    return {
+        "looped": n >= min_repeats,
+        "repeats": n,
+        "unit": unit[:160] if n >= min_repeats else None,
+    }
 
 
 def build_prompts():
@@ -266,12 +296,12 @@ async def run_condition(url, name, prompt, tools_json, pcm, seconds):
                     event_counts[t] = event_counts.get(t, 0) + 1
                     if t == AGENT_TEXT:
                         transcript_parts.append(data.get("delta") or "")
-                    elif t in USER_ASR:
+                    elif t == USER_ASR_DELTA:
                         # Kept separately: useful for checking the model heard the clip at
                         # all, but it is NOT the agent's reply and must not be scored as one.
-                        user_asr_parts.append(
-                            data.get("delta") or data.get("transcript") or ""
-                        )
+                        user_asr_parts.append(data.get("delta") or "")
+                    elif t == USER_ASR_DONE:
+                        user_asr_parts.append(" | ")  # turn boundary, not more text
                     elif t == TOOL_DONE:
                         tool_calls.append(
                             f"{data.get('name')}({data.get('arguments')})"[:300]
@@ -310,11 +340,16 @@ async def run_condition(url, name, prompt, tools_json, pcm, seconds):
     text = "".join(transcript_parts)
     spans = REFUSAL_RE.findall(text)
     safety = SAFETY_RE.findall(text)
+    loop = loop_stats(text)
     return {
         "condition": name,
         "prompt_chars": len(prompt),
         "n_tools": len(tools_json),
         "transcript_chars": len(text),
+        # The actual mode-H phenomenon; see loop_stats.
+        "looped": loop["looped"],
+        "loop_repeats": loop["repeats"],
+        "loop_unit": loop["unit"],
         "refusals": len(spans),
         "refused": bool(spans),
         "refusal_spans": sorted(set(spans))[:6],
@@ -382,34 +417,32 @@ async def main_async(args) -> int:
               f"err={r.get('error')}")
 
     print(f"\n{'condition':<20} {'prompt':>7} {'tools':>5} {'said':>6} "
-          f"{'refuse':>7} {'safety':>7} {'calls':>6}")
-    print("-" * 68)
+          f"{'refuse':>7} {'safety':>7} {'calls':>6} {'loop':>6}")
+    print("-" * 76)
     for r in rows:
         print(f"{r['condition']:<20} {r.get('prompt_chars',0):>7} {r.get('n_tools',0):>5} "
               f"{r.get('transcript_chars',0):>6} {str(r.get('refused')):>7} "
-              f"{str(r.get('safety_refusal')):>7} {r.get('tool_calls',0):>6}")
+              f"{str(r.get('safety_refusal')):>7} {r.get('tool_calls',0):>6} "
+              f"{('x' + str(r.get('loop_repeats',0))) if r.get('looped') else '-':>6}")
+
+    # THE LOOP IS THE VERDICT, not the refusal. An earlier version of this script gated on the
+    # baseline producing a SAFETY refusal and declared every other row uninterpretable when it
+    # did not. That was backwards: the baseline did not refuse and still looped, so the gate was
+    # hiding the finding. Refusals are still reported, as a sub-case.
+    looped = [r["condition"] for r in rows if r.get("looped")]
+    clean = [r["condition"] for r in rows if not r.get("looped")]
+    print(f"\nlooped ({len(looped)}/{len(rows)}): {looped or 'none'}")
+    print(f"did NOT loop: {clean or 'none'}")
+    if len(looped) == len(rows) and len(rows) > 1:
+        print("  Every prompt loops, including the short benign one -- so the loop is not\n"
+              "  caused by policy length or subject matter. Next suspect is the session\n"
+              "  itself (duration, or what the provider does that this replay does not).")
 
     base = next((r for r in rows if r["condition"] == "baseline"), None)
-    if base is None:
-        pass
-    elif not base.get("safety_refusal"):
-        print("\nGATE FAILED: baseline produced no SAFETY refusal, which is the mode-H\n"
-              "phenomenon. Sampling is greedy, so with the real prompt and a stimulus that\n"
-              "reaches the account part of the task it should. Either the stimulus does not\n"
-              "get far enough or the harness differs from the provider -- in both cases the\n"
-              f"other rows say nothing about mode H. (Ordinary refusal present: "
-              f"{base.get('refused')}.)")
-    else:
-        cleared = [
-            r["condition"] for r in rows
-            if r["condition"] != "baseline" and not r.get("safety_refusal")
-        ]
-        print(f"\nbaseline reproduced the SAFETY refusal ({base.get('safety_spans')}).")
-        print(f"conditions that did NOT produce one: {cleared or 'none'}")
-        if not cleared and len(rows) > 1:
-            print("  Nothing cleared it -- not instruction vs policy vs tools vs length.\n"
-                  "  Next suspect is the container's own prompt template\n"
-                  "  (USE_JINJA_TEMPLATE_PROMPT=0 builds a different one).")
+    if base is not None and not base.get("safety_refusal"):
+        print("\nNo SAFETY refusal on the baseline. Expected: as of 2026-08-24 this replay does\n"
+              "not reproduce the refusal even with a byte-identical prompt, while the real\n"
+              "provider on the same server does. The loop above is the comparable signal.")
 
     for r in rows:
         print(f"\n--- {r['condition']} ---")

@@ -72,6 +72,15 @@
 # already had, so a longer cap cannot explain a difference in argument grounding. Matching
 # arm B instead makes A' vs B a direct comparison.
 #
+# READ THIS BEFORE SPENDING API BUDGET: as of 2026-08-24 this arm still produces nothing.
+# Clearing all four gates is necessary and not sufficient. A live retail-7 episode at
+# LLM_MAX_MODEL_LEN=131072 reproduced mode H verbatim -- the agent greets, emits a safety
+# refusal, and loops it until the session dies, with 0 tool calls (NEMO_FAILURE_MODES.md §3).
+# The refusal is NOT caused by the prompt: the byte-identical prompt replayed open-loop against
+# the same server does not refuse (scripts/mode_h_probe.py). Until that is understood, every
+# episode this script runs costs ElevenLabs and Bedrock budget and returns an
+# infrastructure_error. Run the probe first; it needs no TTS and no user simulator.
+#
 # Usage: NEMO_RT_URL=ws://ip-10-1-30-86:9000 scripts/tau2_nemo_rt.sh retail 7 35 49 64 78
 #        scripts/tau2_nemo_rt.sh airline 3 15 28
 
@@ -93,9 +102,12 @@ USER_LLM="${USER_LLM:-bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0}"
 RUN_NAME="${RUN_NAME:-nemo_rt_0821}"
 COMPLEXITY="${COMPLEXITY:-control}"
 CAP_SECONDS="${CAP_SECONDS:-1200}"
-# 1, not 2. The container is a single Triton/vLLM instance on one GPU serving one realtime
-# session at a time, and the shared ElevenLabs plan allows 2 concurrent requests TOTAL across
-# every arm running right now. Fanning out here would 429 the Gemini control as well.
+# 1, and the reason is the CONTAINER, not TTS. The container is a single Triton/vLLM instance on
+# one GPU (audio_server.py:48 hardcodes TRITON_URL to localhost, so one server per node) and its
+# sustainable concurrent-session count is unmeasured. TTS is not the constraint it was once
+# thought to be: measured 2026-08-24, the ElevenLabs key admits 15 concurrent requests, not 2
+# (tau-voice-2/scripts/probe_tts_concurrency.py). Raise this only after measuring what the
+# container sustains, and remember TTS's 15 is shared across every arm running at that moment.
 CONCURRENCY="${CONCURRENCY:-1}"
 VOICES="${VOICES:-$HERE/tau2_stock_voices.env}"
 LOGDIR="${LOGDIR:-$HERE/../logs/$RUN_NAME}"

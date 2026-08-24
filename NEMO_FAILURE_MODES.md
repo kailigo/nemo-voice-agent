@@ -246,7 +246,9 @@ skips the greeting entirely:
 
 Nothing in either task is illicit: task 3 changes a booking, task 7 looks up an order. The
 model invents the violation, and it does so **before the user has asked for anything**
-substantive — so this is a reaction to the system prompt, not to user speech.
+substantive. That reads as a reaction to the system prompt, and it was recorded here as one.
+A controlled replay on 2026-08-24 showed it is not — see *What the refusal actually is*
+below, which supersedes that reading.
 
 The loop is mechanically exact. The container's TTS ratio cap fires at decoder steps 178,
 1162, 2146, 3130, 4114, 5098, 6082 — spaced **984 apart**, each reporting the identical
@@ -261,8 +263,24 @@ the LLM context is exhausted.
   (the prompt embeds `<AVAILABLE_TOOLS>`); there are no emissions. The earlier reading of
   "the container never calls a tool" was right about the count and wrong about the cause — it
   is refusal, not weak tool-use instructions.
-* **The FDB-v3-vs-τ-voice path comparison is blocked on this**, not on argument grounding. Mode
-  A cannot be attributed to the research path until the container will actually run a domain.
+* **The FDB-v3-vs-τ-voice path comparison is blocked on this**, not on argument grounding — but
+  **mode A is no longer plausibly path-specific.** The 2026-08-24 probe got the container to
+  emit tool calls on the real retail prompt, and its arguments are invented the same way the
+  research path's were. User id spoken as `mei_kovacs_8020`:
+
+  | condition | what it sent |
+  |---|---|
+  | `baseline` | `exchange_delivered_order_items(order_id="MEI_8020", item_ids=["item1","item2"], new_item_ids=["item3","item4"], payment_method_id="gift_card_0000")` |
+  | `policy_only` | `cancel_pending_order(order_id="MEI-10020", reason="no longer needed")` |
+  | `baseline_no_tools` | `authenticate_user(user_id="may_1234")`, then `"mey_1234"` |
+
+  The **user id is placed in `order_id`** (retail order ids are `#W…` numbers), mangled two
+  different ways, and the rest of the slots are filled with schema-shaped placeholders. Both
+  runs also put a **write action first**, before any read. Compare the research path's
+  `SIN-555` for `SI5UKW` and `JFK59001` for `anya_garcia_5901`: same invention, same
+  slot-filling. Caveat: open-loop, so no tool results came back and the placeholders are partly
+  a harness artifact — but `MEI_8020` is a turn-one grounding error that owes nothing to
+  missing tool results. Quantifying this still needs a scorable episode.
 
 **An explicit authorization instruction does not move it.** Arm A″
 (`nemo_rt_0822e_extra`, retail 7) appended 305 chars via `NEMO_RT_EXTRA_INSTRUCTIONS` —
@@ -276,14 +294,86 @@ from the hypothesis: the plan was that FDB-v3's *"Execute the tool unconditional
 carrying its tool-use numbers. On τ-voice that class of directive does not even clear the
 refusal, so it cannot be what separates the two benchmarks here.
 
-**Not yet attributed, and do not claim it is.** Two untested confounds:
+#### What the refusal actually is (2026-08-24)
 
-* This ran with `USE_JINJA_TEMPLATE_PROMPT=1`. The non-jinja branch builds a different prompt
-  (`audio_server.py:1179-1198` + `TOOLS_TEMPLATE`) and has not been tried.
-* FDB-v3 prompts work fine on this same container, so something distinguishes them from a
-  τ-voice policy — length (7469 chars), or the authenticate/refund/payment subject matter.
-  Until one of those is isolated, "the container refuses τ-voice policies" is the observation,
-  not the mechanism.
+**The refusal is one instance of a verbatim-repetition loop, and the loop is the primary
+failure.** Measured with `scripts/mode_h_probe.py`, which replays a persisted user channel
+open-loop against the live container so the prompt can be varied while everything else is
+held fixed. Six prompt conditions, one 291 s session each, plus a live closed-loop episode
+through the real provider for comparison:
+
+Repetition is measured, not eyeballed: `loop_stats` counts the most frequent sentence ≥12 chars
+and calls it a loop at ≥3. Eyeballing the transcripts had put every row in the loop column;
+the measurement says 4 of 6.
+
+| condition | prompt | refused | safety refusal | tool calls | loop |
+|---|---|---|---|---|---|
+| `baseline` | the real 7469-char arm A′ prompt | no | **no** | 7 | **×17** — the user's id |
+| `policy_only` | retail policy, no voice instruction | 2 (task-class) | no | 7 | no (×2) |
+| `instruction_only` | voice instruction, no policy | 1 | no | 0 | ×17 — the user's id |
+| `benign_short` | **131 chars, no domain policy** | 5 | no | 0 | **×6** — "provide your order ID" |
+| `baseline_no_tools` | baseline, `tools` omitted | 1 | no | **5** (mode F) | no (×2) |
+| `truncated_policy` | baseline, policy cut to 1500 chars | 0 | no | 0 | ×17 — the user's id |
+| *live, real provider* | the same 7469-char prompt | **yes** | **yes** | 0 | ×25+ — the refusal |
+
+Four things follow, and the first two retire earlier claims in this section.
+
+1. **The prompt is not the cause.** The baseline prompt was verified byte-identical to the one
+   the refusing sessions used — SHA-256 of the `instructions` string logged by the server is
+   `8d1c5d39f1b9…` for all of them, 2 sessions on serve v2, 8 on v3, and the probe's baseline
+   today. Same bytes, and the probe did not refuse. The container also decodes **greedily**
+   (`model.py:205`: `top_p=1.0, temperature=0.0, repetition_penalty=1.0`, `seed=0`), so a
+   prompt-caused refusal under identical input was not free to vary.
+2. **Prompt-content ablation cannot fix it, which is why arm A″ failed.** Appending 305 chars
+   of authorization changed the prompt and got a byte-identical refusal 10 times. Read at the
+   time as "the refusal is insensitive to being told the session is legitimate"; the better
+   reading is that the prompt was never the lever.
+3. **Neither length nor subject matter distinguishes τ-voice from FDB-v3.** `benign_short` is
+   131 chars, has no policy, and names no sensitive operation — and it loops ×6 anyway, while
+   the full 7469-char policy in `policy_only` does not loop at all. So the loop does not track
+   prompt size or content in either direction. What is left is the session: FDB-v3 turns are
+   short, τ-voice episodes are 250 s+ duplex conversations.
+4. **The refusal text is stable within a server process and varies across processes.** Same
+   prompt bytes, three launch-identical servers (jobid 1403, GPU 7, `MAX_SESSION_DURATION=1300`,
+   `max_model_len=65536` for the first two):
+
+   | server | sessions | what it locked onto |
+   |---|---|---|
+   | serve v2 | 2 | *"…requests that involve **transferring users to human agents**, as per my guidelines"* |
+   | serve v3 | 8 | *"…requests that involve **unauthorized access to user accounts, payment information, or personal data**"* |
+   | 0824, `max_model_len=131072` | 1 live | v2's text again, verbatim |
+   | 0824, same server, probe replay | 1 | no refusal — loops the user's id instead |
+
+   Both refusals are the same frame with a different prohibition slotted in, and both
+   prohibitions are lifted from the retail policy. The last two rows are the same server
+   process behaving differently under two clients, so this is not a per-process attractor
+   either.
+
+**Raising `max_model_len` does not fix it.** The live 2026-08-24 episode ran at 131072, four
+gates cleared, and reproduced the refusal and the loop verbatim with **0 tool calls**. Arm A′
+is still blocked and there is still no measured container number on τ-voice.
+
+**What is excluded as the trigger**, each checked rather than argued: the prompt bytes;
+sampling nondeterminism (greedy, seeded); `max_model_len` (refuses at 65536 *and* 131072);
+rope scaling (none configured — the only `rope` key in the vLLM config is the unrelated
+`fuse_rope_kvcache_cat_mla` pass flag); the declared audio format (both clients send
+`audio/pcm` at 16000); input pacing (`adapter.py:287` sleeps to hold real time, and the probe
+streams at real time); and silence encoding (`TELEPHONY_ULAW_SILENCE = b'\x7f'` decodes to
+exactly 0, so τ-voice dodges the `b'\x00'` → −32124 trap; the replayed stimulus' first 5.2 s
+is 0 nonzero samples). At the moment the refusal fires — ~3 s in, tick 15, before any user
+speech — both clients had fed the container identical prompt bytes and identical digital-zero
+audio.
+
+**Still open, and narrower than before:** what the provider does that an open-loop replay does
+not. The one known difference is `conversation.item.create` for tool results
+(`provider.py` override 5), which cannot explain an onset that precedes the first tool call.
+Also untried: `USE_JINJA_TEMPLATE_PROMPT=0`, whose non-jinja branch builds a different prompt
+(`audio_server.py:1179-1198` + `TOOLS_TEMPLATE`).
+
+**Caveat on the probe.** It is not an eval: no tool executor, so tool results are never
+returned and the model conditions on its own calls only. Its `heard` field shows every user
+turn twice, which is the probe's own accumulation of user-ASR delta *and* done events, not a
+measured container behaviour.
 
 **Four gates, not two, and WS 1011 does not identify which.** Reaching the refusal at all
 required raising three silent truncation limits; a fourth is still binding. Full detail and the
@@ -464,18 +554,24 @@ Ranked by (episodes blocked) × (confidence the mode is real).
 
   The stimulus problem is solved and costs nothing: τ-voice persisted `both.wav` plus label
   tracks per episode, so all readouts use the exact waveform that produced `SIN-555`.
-* **Why does the container refuse τ-voice policies (mode H) when it runs FDB-v3 fine?** This is
-  now the blocker on arm A′ and therefore on the whole path comparison. Three cheap tests, in
-  order of how much they would explain:
+* **Why does the container refuse τ-voice policies (mode H) when it runs FDB-v3 fine?**
+  **Re-posed 2026-08-24 — the premise was wrong.** It does not refuse *policies*: a 131-char
+  benign prompt with no policy at all falls into the same verbatim loop, and the byte-identical
+  policy prompt does not refuse under an open-loop replay (§3 mode H, *What the refusal
+  actually is*). Two of the three tests below are done — the ~2k truncation and the
+  short-benign-prompt variant both loop — so prompt length and subject matter are excluded.
+  The live question is now: **what does the τ-voice provider do that an open-loop replay of the
+  same bytes does not?** Remaining cheap tests:
 
   | test | isolates | cost |
   |---|---|---|
-  | run one episode with `USE_JINJA_TEMPLATE_PROMPT=0` | prompt template vs policy content | 1 episode + a server restart |
-  | send an FDB-v3 prompt to *this* server | whether the server config or the prompt is at fault | no ElevenLabs, no episode |
-  | truncate a τ-voice policy to ~2k chars | prompt length vs subject matter | 1 episode |
+  | run one episode with `USE_JINJA_TEMPLATE_PROMPT=0` | prompt template vs everything else | 1 episode + a server restart |
+  | replay through the provider's own converter, not scipy | the μ-law→16 kHz input path | no ElevenLabs, no episode |
+  | probe condition that returns tool results (`conversation.item.create`) | provider override 5 | no ElevenLabs |
 
-  Already excluded: appending an authorization instruction (arm A″ — no effect, §3 mode H), and
-  the two-gate/timeout explanations (gates 1–4 are all cleared or identified).
+  Already excluded: appending an authorization instruction (arm A″ — no effect, §3 mode H);
+  the two-gate/timeout explanations (gates 1–4 all cleared or identified); and the eight items
+  listed under *What is excluded as the trigger* in §3.
 * **Does mode C survive when the id *is* supplied cleanly?** i.e. is it a grounding failure
   or a policy failure ("always fill the slot")?
 * **Telecom is entirely unmeasured** — 0 of the subset's 8 telecom episodes have run on
@@ -537,3 +633,19 @@ overwrites the arm you were going to compare against.
   decoder steps (5000 ≈ 400 s, a tensor shape) and LLM context refill (≈489 s at 65536, which
   surfaces as `append_request: request not found`) — and the discovery that gates 1, 3 and 4
   are **all** WS 1011 client-side, so the close code cannot identify which one fired.
+* **2026-08-24** — mode H re-diagnosed, and the "refuses the domain" reading retired. A
+  controlled prompt sweep (`scripts/mode_h_probe.py`, six conditions, plus one live episode)
+  shows the refusal is **one instance of a verbatim-repetition loop**, and the loop, not the
+  refusal, is the failure. Evidence: the byte-identical 7469-char prompt (SHA-verified against
+  the refusing sessions' server logs) does **not** refuse under an open-loop replay on the same
+  server process, while a **131-char benign prompt with no policy** loops anyway. The container
+  decodes greedily (`temperature=0.0`, `seed=0`), so a prompt-caused refusal was not free to
+  vary — yet the refusal's content differs across server processes and matches within one. This
+  retires two earlier claims: that the refusal is a reaction to the system prompt, and that
+  prompt length or subject matter is what separates τ-voice from FDB-v3. Raising
+  `max_model_len` to 131072 does not help: the live episode reproduced the refusal verbatim
+  with 0 tool calls, so **arm A′ is still blocked**. Two positives fell out of it — the
+  container *does* emit tool calls on the real retail prompt, and it invents identifiers the
+  same way the research path does (`MEI_8020`/`MEI-10020` from `mei_kovacs_8020`, put in
+  `order_id`), so **mode A is not path-specific**; and it emits tool calls even with `tools`
+  omitted (mode F). Eight candidate triggers were checked and excluded, listed in §3.
