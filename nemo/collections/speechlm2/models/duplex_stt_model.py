@@ -176,6 +176,129 @@ def _sample_text_token(
     return sampled
 
 
+_nemotron_h_cache_patched = False
+
+
+def _patch_nemotron_h_cache_conv_state_bug(cache_cls):
+    """
+    Nemotron-H's vendored HybridMambaAttentionDynamicCache (modeling_nemotron_h.py, copied
+    from HF's Jamba cache) has two copy-paste bugs: update_conv_state/update_ssm_state index
+    `self.conv_states.device`/`self.ssm_states.device` on the *list*, not the per-layer
+    tensor, so both raise `AttributeError: 'list' object has no attribute 'device'` on the
+    first incremental step. Patched at runtime rather than edited in the shared HF cache file
+    so the fix lives in code we own and review.
+    """
+    global _nemotron_h_cache_patched
+    if _nemotron_h_cache_patched:
+        return
+
+    def update_conv_state(self, layer_idx, new_conv_state, cache_init=False):
+        if cache_init:
+            self.conv_states[layer_idx] = new_conv_state.to(self.conv_states[layer_idx].device).contiguous()
+        else:
+            self.conv_states[layer_idx] = self.conv_states[layer_idx].roll(shifts=-1, dims=-1)
+            self.conv_states[layer_idx][:, :, -1] = new_conv_state[:, 0, :].to(
+                self.conv_states[layer_idx].device
+            )
+        return self.conv_states[layer_idx]
+
+    def update_ssm_state(self, layer_idx, new_ssm_state):
+        self.ssm_states[layer_idx] = new_ssm_state.to(self.ssm_states[layer_idx].device).contiguous()
+        return self.ssm_states[layer_idx]
+
+    cache_cls.update_conv_state = update_conv_state
+    cache_cls.update_ssm_state = update_ssm_state
+    _nemotron_h_cache_patched = True
+
+
+_nemotron_h_block_patched = False
+
+
+def _patch_nemotron_h_block_attention_cache_bug(block_cls):
+    """
+    NemotronHBlock.forward's attention branch calls
+    `self.mixer(hidden_states, cache_position=cache_position)` -- it never passes
+    `past_key_value=cache_params` through to the attention mixer. NemotronHAttention.forward
+    only touches its KV cache `if past_key_value is not None`, so with this omission every
+    attention layer silently self-attends over just the current call's tokens with zero
+    cross-step memory once real incremental (cache_position[0] > 0) calls start -- the Mamba
+    layers keep their recurrent state correctly, but the attention layers forget everything
+    before the current token. Patched at runtime for the same reason as the cache bugs above.
+    """
+    global _nemotron_h_block_patched
+    if _nemotron_h_block_patched:
+        return
+
+    def forward(self, hidden_states, cache_params=None, cache_position=None, attention_mask=None):
+        with torch.cuda.stream(torch.cuda.default_stream(hidden_states.device)):
+            residual = hidden_states
+            hidden_states = self.norm(hidden_states.to(dtype=self.norm.weight.dtype))
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+
+            if self.block_type == "mamba":
+                hidden_states = self.mixer(
+                    hidden_states, cache_params=cache_params, cache_position=cache_position
+                )
+            elif self.block_type == "attention":
+                hidden_states = self.mixer(
+                    hidden_states, cache_position=cache_position, past_key_value=cache_params
+                )
+                hidden_states = hidden_states[0]
+            elif self.block_type == "mlp":
+                hidden_states = self.mixer(hidden_states)
+            else:
+                raise ValueError(f"Invalid block_type: {self.block_type}")
+
+            hidden_states = residual + hidden_states
+            return hidden_states
+
+    block_cls.forward = forward
+    _nemotron_h_block_patched = True
+
+
+def build_nemotron_h_hybrid_cache(pretrained_llm: str, config, batch_size: int, dtype, device):
+    """
+    Build a correctly-shaped HybridMambaAttentionDynamicCache for Nemotron-H incremental
+    decoding. Fixes, on top of the vendored class:
+      1. `conv_kernel_size` is never set by __init__, but the Mamba2 mixer's
+         cuda_kernels_forward reads `cache_params.conv_kernel_size` directly.
+      2/3. update_conv_state/update_ssm_state bugs, patched above.
+      4. conv_states must be allocated with conv_dim = mamba_num_heads*mamba_head_dim +
+         2*n_groups*ssm_state_size (the mixer's own conv_dim), not intermediate_size alone --
+         the conv1d convolves the concatenated [hidden_states, B, C] projection.
+      5. ssm_states must be genuinely 4-D (batch, nheads, dim, dstate); a 3-D tensor is
+         silently unsqueezed to nheads=1 by mamba_ssm's selective_state_update, which is wrong
+         whenever the real model has mamba_num_heads > 1.
+    """
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    HybridMambaAttentionDynamicCache = get_class_from_dynamic_module(
+        "modeling_nemotron_h.HybridMambaAttentionDynamicCache",
+        pretrained_model_name_or_path=pretrained_llm,
+    )
+    _patch_nemotron_h_cache_conv_state_bug(HybridMambaAttentionDynamicCache)
+    NemotronHBlock = get_class_from_dynamic_module(
+        "modeling_nemotron_h.NemotronHBlock",
+        pretrained_model_name_or_path=pretrained_llm,
+    )
+    _patch_nemotron_h_block_attention_cache_bug(NemotronHBlock)
+    cache = HybridMambaAttentionDynamicCache(config, batch_size=batch_size, dtype=dtype, device=device)
+    cache.conv_kernel_size = config.conv_kernel
+    cache._frames_seen = 0
+
+    conv_dim = config.mamba_num_heads * config.mamba_head_dim + 2 * config.n_groups * config.ssm_state_size
+    for i in range(config.num_hidden_layers):
+        if cache.hybrid_override_pattern[i] == "M":
+            cache.conv_states[i] = torch.zeros(
+                batch_size, conv_dim, config.conv_kernel, device=device, dtype=dtype
+            )
+            cache.ssm_states[i] = torch.zeros(
+                batch_size, config.mamba_num_heads, config.mamba_head_dim, config.ssm_state_size,
+                device=device, dtype=dtype,
+            )
+    return cache
+
+
 class DuplexSTTModel(LightningModule, HFHubMixin):
     def __init__(self, cfg: dict) -> None:
         assert isinstance(cfg, dict), (
@@ -501,6 +624,20 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
             if cache is not None:
                 kwargs['use_cache'] = True
                 kwargs[self.cfg.get("cache_key", "past_key_values")] = cache
+                # modeling_nemotron_h.py defaults cache_position to arange(T) (always
+                # starting at 0) when not passed, so every incremental step was being
+                # treated as position 0 without this. NOTE: HybridMambaAttentionDynamicCache's
+                # own get_seq_length() is broken for this hybrid_override_pattern -- it reads
+                # key_cache[self.transformer_layers[0]].shape[-2], and transformer_layers[0]
+                # can land on an MLP-only ('-') layer that never calls cache.update(), so it
+                # permanently returns key_cache's placeholder shape[-2] == batch_size, not the
+                # real position count. We track position ourselves instead.
+                past_len = getattr(cache, "_frames_seen", 0)
+                T = input_embeds.shape[1]
+                kwargs["cache_position"] = torch.arange(
+                    past_len, past_len + T, device=input_embeds.device
+                )
+                cache._frames_seen = past_len + T
             out = self.llm(**kwargs)
         else:
             out = self.llm(
@@ -3729,9 +3866,17 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         use_cache = True
         if 'Nemotron' in self.cfg.pretrained_llm:
-            cache = None
-            use_cache = False
-            logging.info("Using no-cache mode for Nemotron (full history each step)")
+            if self.cfg.get("disable_mamba_hybrid_cache", False):
+                cache = None
+                use_cache = False
+                logging.info("Using no-cache mode for Nemotron (full history each step)")
+            else:
+                cache = build_nemotron_h_hybrid_cache(
+                    self.cfg.pretrained_llm, self.llm.config, batch_size=B,
+                    dtype=next(self.llm.parameters()).dtype, device=input_signal.device,
+                )
+                use_cache = True
+                logging.info(f"Using HybridMambaAttentionDynamicCache for Nemotron (batch_size={B})")
         else:
             cache = DynamicCache()
             use_cache = True
