@@ -312,6 +312,18 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
 
         maybe_install_lora(self)
 
+        # Enable HF gradient checkpointing on the LLM backbone. Halves activation memory,
+        # +25-30% wall time. `use_reentrant=False` is the non-legacy path that plays well with
+        # DDP find_unused_parameters=True. We deliberately skip enable_input_require_grads():
+        # DuplexSTTModel deletes the LLM's own embedding table (line ~247) and feeds
+        # `inputs_embeds` from the fusion module, so the input to the LLM already carries grad.
+        # Calling enable_input_require_grads would fail on get_input_embeddings() anyway.
+        if self.cfg.get("gradient_checkpointing", False):
+            self.llm.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            logging.info("Gradient checkpointing enabled on self.llm")
+
         # Load the pretrained streaming ASR model
         setup_speech_encoder(self, pretrained_weights=self.cfg.get("pretrained_weights", True))
 

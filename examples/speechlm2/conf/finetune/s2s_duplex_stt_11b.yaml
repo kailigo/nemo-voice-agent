@@ -150,6 +150,12 @@ model:
   duplex_asr_text_weight: 1.0  # inert while predict_user_text is false
   duplex_function_channel_weight: 2.0
 
+  # HF gradient checkpointing on the LLM backbone. Halves activation memory at ~+25-30%
+  # wall time. Wired in duplex_stt_model.py after maybe_install_lora with `use_reentrant=False`
+  # and enable_input_require_grads() so PEFT deltas still receive gradients through the
+  # checkpointed base forward. Turn this on when cuts exceed ~200s per rank on H200s.
+  gradient_checkpointing: true
+
   # LoRA configuration — enables parameter-efficient finetuning
   # NOTE: deliberately no `task_type: CAUSAL_LM`. DuplexSTTModel sets
   # self.llm = llm.backbone (a bare NemotronHModel) and keeps lm_head separately,
