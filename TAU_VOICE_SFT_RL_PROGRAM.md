@@ -427,3 +427,77 @@ reasons.
 | collection + data prep, how to run it | `tau-voice-2/user_docs/sft_data_collection_runbook.md` |
 | the data contract and its seven consumer traps | `tau-voice-2/user_docs/training_data_generation.md` |
 | reward-blind scoring instrument | `tau-voice-2/scripts/score_voice_run.py` |
+| SFT input/output tensor construction (channels, FC insertion, losses) | `SFT_DATA_TO_TENSORS.md` |
+
+---
+
+## 10. 2026-08-31: first Phase-S pass on a genuinely new domain batch
+
+**Corpus.** `data/tau2_training_samples/shards-0828`: 354 cuts, 4 new domains (banking 146,
+healthcare scheduling 120, events & ticketing 54, car rental 34), 13.79 h, zero overlap with the
+airline/retail `mix_full86` used for the earlier concept-verification checkpoint. Split
+334 train / 20 val (5/domain, held out before any training). Verified against
+`max_fc_total_tokens=12000` (`scripts/measure_fc_token_budget.py`): 0 cuts dropped, min headroom
+6,915 tokens.
+
+**§2.3's coverage concern is measurably better in this batch.** The old corpus "yields one
+error-recovery span" (§2.1). This one has **90/354 cuts (25%) containing at least one
+`<TOOL_RESPONSE>` error, 142 total occurrences** (counted directly from the shards). The §6
+falsifier "coverage report still shows p3 = 0 spans" does **not** fire here.
+
+**New risk, not previously in the register: step budget must be picked by validation, not copied
+from a prior run's cadence.** Trained fresh from the base checkpoint (not resumed from the
+airline/retail run — domains were kept separate, not mixed) for 2000 steps, checkpointing every
+500. Forward-loss eval (`scripts/eval_forward.py`, teacher-forced, no ElevenLabs/tau2 needed) on
+the 20-cut held-out val set:
+
+| checkpoint | loss | token_accuracy | function_sotc_acc |
+|---|---|---|---|
+| base | 1.524 | 45.0% | 4.2% |
+| **step500** | **0.752** | **66.3%** | **36.8%** |
+| step1000 | 0.930 | 64.2% | 7.0% |
+| step1500 | 1.039 | 64.5% | 6.4% |
+| step2000 | 1.060 | 64.2% | 6.4% |
+
+Step 500 is best on every metric; steps 1000–2000 monotonically degrade, and `function_sotc_acc`
+(recall on the `<SOTC>` "start tool call" marker — the single metric closest to "does the model
+know when to call a tool") falls back to near-base by step 1000 and stays there. The step count
+(2000) was picked by matching the *previous* run's total-batches-per-cut ratio (500 steps / 80
+cuts ≈ 6.25×, scaled to 334 cuts ≈ 2000) without checking whether that ratio was itself a good
+target — it wasn't. **Mitigation for future SFT passes: checkpoint every 100–250 steps early and
+pick by held-out loss/`sotc_acc`, don't commit to a fixed step count derived from a prior run's
+cadence.** Cross-checked on a second held-out condition (see next finding) with the same ranking,
+so this is not noise specific to one 20-cut set.
+
+**Cross-domain transfer is real, and it is the strongest evidence yet for §0's "core bet."**
+`step500` (trained only on the 4 new domains) was scored on all 86 cuts of `mix_full86`
+(airline/retail — entirely unseen by this checkpoint) against `base` and against the
+airline/retail-trained checkpoint from the concept-verification run:
+
+| checkpoint (scored on `mix_full86/val`, 6 held-out cuts) | loss | token_accuracy | function_sotc_acc |
+|---|---|---|---|
+| base | 1.382 | 47.4% | 3.7% |
+| airline/retail-trained (in-domain) | 1.102 | 64.6% | 20.1% |
+| new-domains step500 (**cross-domain**) | 1.001 | 57.4% | 27.1% |
+| new-domains step1000/1500/2000 | 1.170 → 1.297 (rising) | ~55% (flat) | 14.0% → **3.3%** (falls below base) |
+
+A model trained on banking/healthcare/events/car-rental beats both the untrained base *and* the
+airline/retail-trained checkpoint's own numbers on airline/retail loss and `sotc_acc` (n=6, hold
+this specific ranking loosely) — real support for "τ-voice failure is a coverage/format problem,
+not a capability wall" (§0, §1), since the transferring skill has to be generic duplex/FC
+mechanics, not domain facts. The same overfitting-past-step500 collapse reproduces cross-domain
+too, down to `sotc_acc` falling *below* base by step 2000 — confirming it's a property of the
+training run, not an artifact of one eval set.
+
+**Where this leaves Phase S's decision gate (§5, §6):** argument-accuracy proxies moved
+substantially at the correct checkpoint (step500) — the gate does not fire the "stop and
+re-diagnose" falsifier. Not yet done: the §6 primary gate is specified as *FDB-v3-style argument
+accuracy on τ-voice tool calls with per-mode A–G counts*, which needs either a live tau2 episode
+(blocked on ElevenLabs, unrelated to any of the above) or an offline argument-extraction pass over
+generated output — `token_accuracy`/`sotc_acc` here are forward-loss proxies, not that metric.
+
+**How to apply going forward:** (1) keep collecting new domains (Phase C, in progress); (2) next
+SFT pass, checkpoint frequently and select by held-out validation rather than a fixed step
+target; (3) as the domain pool grows, keep at least one domain held out from training
+deliberately — the three-arm design (`TAU_VOICE_SFT_PLAN.md`) needs a real cross-domain arm, and
+that requires *not* training on everything collected.
