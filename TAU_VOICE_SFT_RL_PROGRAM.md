@@ -588,3 +588,29 @@ with a longer generation window and a less strict correctness check than exact s
 (3) before trusting "SFT fixes mode H" as a real claim, test the *SFT-500-on-airline/retail*
 checkpoint (`sft_train8_0826`, in-domain for these receipts) and a larger receipt set — 4 examples
 from one checkpoint is a lead, not a result.
+
+**Done same day: the in-domain checkpoint test, and it both strengthens and complicates §11.**
+Ran `sft_train8_0826`'s `step-500.ckpt` (trained ON airline/retail — in-domain for all 4 receipts)
+through the identical readout-1 harness. Result: **0/4 mode-H refusals**, matching the cross-domain
+checkpoint — so the suppression finding now holds on 2/2 SFT checkpoints tested, independent of
+whether the training domains match the receipts' domains. That part of the claim is stronger.
+
+But the *failure mode* differs by checkpoint, and none of the three tested so far has produced
+the thing readout 1 is meant to elicit (an attempted copy that's wrong) — each fails a different
+way instead:
+
+| checkpoint | behavior on all 4 receipts |
+|---|---|
+| base | outright refusal text ("I am unable to assist...") — mode H |
+| cross-domain SFT (`shards-0828`) | engages conversationally, asks to confirm spelling — no call completed |
+| in-domain SFT (`sft_train8_0826`) | **completely silent** — empty text channel, no refusal, no engagement, no call |
+
+Working hypothesis, not yet tested: truncating real audio mid-conversation and appending raw
+silence is itself a distribution shift none of these checkpoints have seen in training (real SFT
+cuts are always full teacher-generated conversations, never "real audio then abrupt silence") —
+plausibly worse for the smaller/shorter SFT runs (500 steps, 80-334 cuts) than for the base model,
+which explains silence rather than an attempt. **Readout 1's harness, as built, has not yet
+produced a clean mode-A signal from any checkpoint** — every run so far has been dominated by a
+different confound. Before concluding anything about mode A specifically, the harness likely needs
+a longer post-truncation window and/or a small in-distribution continuation nudge rather than raw
+silence.
