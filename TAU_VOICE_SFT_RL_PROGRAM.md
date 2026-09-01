@@ -247,6 +247,12 @@ container at all, and nothing suggests it is a weights problem — so an SFT'd c
 container may refuse identically. Already excluded: an appended authorization instruction (arm A″,
 no effect), and the timeout/truncation gates (all four cleared or identified).
 
+**2026-09-01: two of these claims no longer hold — see §11.** Mode H is not container-specific
+(reproduces in a plain `offline_inference()` call, no container involved), and "an SFT'd checkpoint
+may refuse identically" is directly contradicted: the `shards-0828` SFT checkpoint showed **zero**
+refusals on the same 4 receipts where base showed 4/4, on domains it was never trained on. Read §11
+before treating mode H as an unmitigated RL blocker.
+
 Three cheap tests, in order of explanatory power (hours, not days):
 
 | test | isolates | cost |
@@ -501,3 +507,84 @@ SFT pass, checkpoint frequently and select by held-out validation rather than a 
 target; (3) as the domain pool grows, keep at least one domain held out from training
 deliberately — the three-arm design (`TAU_VOICE_SFT_PLAN.md`) needs a real cross-domain arm, and
 that requires *not* training on everything collected.
+
+---
+
+## 11. 2026-09-01: the argument-accuracy gate, built — and mode H is not what §4.1 assumed
+
+**Argument-accuracy scorer built and run** (`scripts/eval_first_call_argument_accuracy.py`),
+scoped to the *first* tool call of each held-out cut (real preceding audio, genuinely
+free-running generation, no forced call positions, no tool executor — see the script's docstring
+for why later calls in an episode aren't scored this way). Scoring reuses FDB-v3's own
+`exact_match_args` (`Full-Duplex-Bench/v3/evaluate_tool_calls.py`) rather than a reimplementation.
+On `shards-0828/val` (20 cuts):
+
+| checkpoint | mean argument accuracy | E_no_call | name_mismatch | name_match, wrong args | name_match, correct |
+|---|---|---|---|---|---|
+| base | 10.0% | 3/20 | 8/20 | 7/20 | 2/20 |
+| step500 | **40.0%** | 6/20 | 0/20 | 6/20 | 8/20 |
+
+A 4x improvement, and stronger evidence than the earlier teacher-forced proxies
+(`token_accuracy`/`sotc_acc`, §10) since nothing here is teacher-forced. step500 calls less often
+(14/20 vs 17/20) but is far more accurate when it does (57% vs 12%). Caveat carried in the
+script's docstring, worth repeating here: "expected" is the teacher's own trajectory, not an
+independently-verified tau2 ground truth — this is closer to distillation fidelity than to §6's
+literal gate, which needs a live episode against the real mock environment.
+
+**Mode-A readout 1 (`NEMO_FAILURE_MODES.md` §7) run, and it surfaced something bigger than mode A.**
+Readout 1 is "the gate" — before running readouts 2/3 (which deliberately change the prompt to
+separate encoder-perception from copy-fidelity), first confirm our own harness reproduces the
+*known* wrong answer from the original episode, given the *unchanged* real prompt and audio.
+
+It did not reproduce (0/4 exact matches on the base model, all 4 receipts from
+`scripts/mode_a_probe.py`) — but not from imprecision. **All 4 receipts show the base model's
+agent-text channel producing an outright mode-H domain refusal** ("I am unable to assist with
+requests that involve booking, modifying, or canceling flight reservations...") — verbatim the
+same failure shape as §3's mode H, previously investigated exclusively through the NIM container.
+This reproduced in a single `offline_inference()` call: no container, no live session, no
+duplex/streaming path, just the base model given real audio truncated before the tool call plus
+trailing silence, and the real domain policy prompt reconstructed byte-for-byte from the
+episode's own recorded `policy` field + `tau-voice-2/data/tool_schemas.json`. **Mode H is not a
+container-serving artifact — it is the base model reacting to real domain-policy content,
+reproducible in the simplest possible harness.** This also means mode A and mode H are entangled:
+testing mode A with a full real prompt can accidentally trigger mode H, and a result should not be
+attributed to one without checking for the other.
+
+**Two follow-up tests, both informative:**
+
+1. **Readout 2's own prescribed short prompt avoids the trigger entirely.** Replacing the domain
+   policy with a short, non-domain instruction ("repeat the id back, call no tools",
+   `scripts/mode_a_readout2.py`) gave **0/4 mode-H refusals** on the base model, confirming the
+   trigger is the long real domain-policy content specifically, not "any prompt" or a property of
+   the model unconditionally. This makes readouts 2/3 usable after all — they were not
+   collaterally broken by the same confound.
+   (One of the four responses was a near-miss worth noting qualitatively even though it fails a
+   strict substring check: airline__28's reply was *"Your reservation ID is SI five UKW"* against
+   an expected `SI5UKW` — letters exactly right, digit spoken as a word. The other three did not
+   engage with the repeat-it-back instruction at all, asking follow-up questions instead — genuine
+   readout-2 signal, not mode H, but not yet a clean encoder-vs-copy answer either.)
+2. **The SFT checkpoint shows zero mode-H refusals on the same 4 receipts, cross-domain.**
+   Running `step-500.ckpt` (trained only on `shards-0828`'s banking/healthcare/events/car-rental —
+   none of these 4 receipts' domains) through the same readout-1 harness: **0/4 refusals**, versus
+   base's 4/4, under the identical real airline/retail domain prompts. Instead of refusing, the
+   model asks the caller to confirm the spelling before proceeding — engaged, not evasive, though
+   it did not complete an actual tool call within the generation window used (8s trailing
+   silence), so this is not yet a full "SFT fixes mode H" result — only "SFT suppresses the
+   refusal," measured on 4 examples in a completely different domain than what it was trained on.
+
+**This corrects §4.1's framing, not just adds to it.** §4.1 says mode H is a container problem and
+"nothing suggests it is a weights problem — so an SFT'd checkpoint in the same container may
+refuse identically." Both halves are now in question: it is not exclusively a container problem,
+and the one SFT'd checkpoint tested does *not* refuse identically — it stops refusing entirely, on
+unseen domains. This does not close risk #15 (still unmeasured: does this hold in the container,
+at duplex/streaming session lengths, on more than 4 examples, on the actual mode-H receipt
+episodes' own domains rather than airline/retail) — but it is the first evidence that mode H has a
+mitigation path through training, not only through prompt/serving engineering.
+
+**How to apply:** (1) the §4.1 three cheap tests (`USE_JINJA_TEMPLATE_PROMPT=0` etc.) are still
+worth running, but frame them as "does the container add anything beyond what the base model
+already does" now, not "is this a container bug"; (2) readouts 2/3 are unblocked — worth finishing
+with a longer generation window and a less strict correctness check than exact substring match;
+(3) before trusting "SFT fixes mode H" as a real claim, test the *SFT-500-on-airline/retail*
+checkpoint (`sft_train8_0826`, in-domain for these receipts) and a larger receipt set — 4 examples
+from one checkpoint is a lead, not a result.
