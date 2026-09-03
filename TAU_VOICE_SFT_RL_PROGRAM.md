@@ -614,3 +614,209 @@ produced a clean mode-A signal from any checkpoint** — every run so far has be
 different confound. Before concluding anything about mode A specifically, the harness likely needs
 a longer post-truncation window and/or a small in-distribution continuation nudge rather than raw
 silence.
+
+---
+
+## 12. 2026-09-01: the first real live τ-voice batch — base beats SFT-500, 2 vs 0
+
+**What ran.** 16 airline tasks × 2 checkpoints (`nemo-base`, `sft_step500_airline_retail`), real
+Gemini-TTS audio, arm A (in-process NeMo), `--speech-complexity control`, 8-way parallel across the
+node's 8 GPUs. First genuinely-scored batch this program has produced — everything before this was
+either forward-loss proxies or single-episode smoke tests.
+
+**Result:**
+
+| checkpoint | success | `stuck_loop` | `timeout` | `user_stop`(reward 0) | `too_many_errors` |
+|---|---|---|---|---|---|
+| base | **2/16 (12.5%)** | 8 | 5 | 0 | 1 |
+| sft-500 | **0/16 (0%)** | 3 | 12 | 1 | 0 |
+
+SFT-500 is not an improvement on this measure — it is worse. And the *shape* of failure shifted:
+base mostly trips the explicit `stuck_loop` detector (identical tool call repeated verbatim — the
+mode-A copy-fidelity bug, e.g. task 28's `get_user_details({'user_id': 'amelia_ross_1297'})` ×3+ for
+the correctly-spelled `amelia_rossi_1297`); SFT-500 mostly just times out (12/16) without ever
+hitting the 3× identical-call trigger. Counting actual tool-call attempts confirms why: **6 of 16
+SFT-500 episodes (37.5%) made zero tool calls at all** across the full ~1200s budget — the model
+talks or goes silent but never attempts the task. This matches the disengagement mode already seen
+in §11's readout-1 (the in-domain SFT checkpoint going "completely silent") — it is not a new
+finding, it is that same failure mode now measured at scale and shown to dominate this checkpoint's
+error profile.
+
+**Reconciling with §10's forward-loss numbers.** Step500 was selected there by held-out loss/
+`token_accuracy`/`function_sotc_acc` (base 1.524/45.0%/4.2% → step500 0.752/66.3%/36.8%) — a real,
+solid improvement on every axis. That metric and today's live success rate now disagree completely.
+The reason is structural, not a measurement error: forward-loss is teacher-forced — the model is
+scored on next-token prediction given the *correct* history at every step, so it never pays for its
+own mistakes. Live evaluation is free-running: every turn conditions on what the model itself said
+one turn ago, so an early wrong copy or a moment of hesitation compounds for the rest of the episode.
+A checkpoint can get strictly better at "predict the right token given a clean history" while
+getting no better (or worse) at "survive an autoregressive conversation without derailing." **Forward-
+loss is not a valid proxy for §6's live gate and should not be used alone to pick a checkpoint again.**
+
+**Harness bugs found and fixed while producing this batch** (all in `tau-voice-2`):
+1. `--gres=gpu:1 --overlap` on a step nested inside a whole-node `salloc` does **not** hand out a
+   distinct physical GPU per step — all 8 parallel processes silently landed on GPU 0, stacked to
+   ~140GB, and OOM'd (`termination_reason: infrastructure_error`, invalidating an entire first
+   attempt at this batch with no loud failure). Fixed: explicit `GPU_ID`/`CUDA_VISIBLE_DEVICES`
+   pinning added to `tau2_nemo_arm_a.sh`, caller must set a distinct index per parallel process.
+2. `--timeout` looked broken (a task ran 631s past its 1800s cap) — **it was not.** `ps etimes`
+   (process wall-clock, what the monitoring used) includes 9-15 minutes of model-load time that the
+   orchestrator's own clock (`_run_start_perf`, set at `Orchestrator.run()`) correctly excludes.
+   Comparing the two gave a false "the safety net doesn't work" alarm; the task was killed
+   prematurely, ~5 minutes before its real internal deadline. Re-verified after the fix: `--timeout`
+   fires within ~1s of its configured value every time, measured from each task's own first tick.
+3. Given (2), the real lever for wall-clock cost is the load tax itself, not a timeout bug: default
+   `TIMEOUT_SECONDS` lowered 1800→1200 (no observed success in this or the prior batch has ever
+   exceeded 804s; 1200s is a safe margin, not a guess), and multi-task-per-process batching
+   (`--task-ids A B --max-concurrency 1`, sequential, reuses the already-loaded model for task B)
+   was used to backfill the tasks lost to (2)'s premature kill without repaying the load cost twice.
+4. Relaunching into a previously-used `RUN_NAME` whose `results.json` partially exists triggers an
+   interactive "resume? (y/n)" prompt (`checkpoint.py:82`) that hits `EOFError` and crashes instantly
+   in a background process with no stdin attached — looks like a fast success, is actually 8
+   simultaneous crashes. No code fix applied (working as intended for interactive use); the
+   operational fix is to never reuse a `RUN_NAME` whose directory wasn't fully cleaned first.
+5. `full_duplex_orchestrator.py` now also has a `STUCK_LOOP` termination reason (added this session,
+   confirmed firing correctly in this batch): terminates as soon as the agent issues the exact same
+   tool call (name + arguments) 3 times, independent of outcome. Zero false positives observed across
+   both batches (32+ episodes) — every firing corresponded to a real repeated-call bug, and one
+   apparent counter-case (task 28 in the earlier smoke test) turned out to be a different episode
+   that resolved naturally, not a `stuck_loop` false alarm.
+
+**How to apply going forward:** (1) never trust forward-loss alone to select a checkpoint again —
+gate on live success rate or a validated free-running proxy (in progress, see next entry once built);
+(2) any future batch launcher must set `GPU_ID` explicitly, must never reuse a `RUN_NAME` without
+cleaning its directory first, and should prefer multi-task-per-process batching over one-process-
+per-task to amortize the model-load tax; (3) mode-A copy-fidelity is now confirmed present in *both*
+checkpoints at scale, not just in the 4 hand-picked receipts — it is the single highest-confirmed-
+leverage target for the next SFT/data pass, ahead of anything else in the risk register.
+
+---
+
+## 13. 2026-09-01: mitigation plan for the two failure modes §12 found, and a fast-check subset
+
+**Fast-check subset, before testing anything else.** Rather than re-running all 16/50 airline tasks
+for every iteration, an 8-task subset was chosen to reliably surface every distinct pattern §12
+found, using the base-vs-sft-500 per-task breakdown as ground truth (not a random sample —
+deliberately biased toward known issues, so it will not by itself surface a genuinely new failure
+mode; an occasional random subset from the untested 34 airline tasks is still needed for that):
+
+| task | base | sft-500 | why included |
+|---|---|---|---|
+| 4 | success | timeout | one of only 2 tasks either checkpoint has solved — regression anchor |
+| 5 | success | timeout | second success anchor, different termination path (`agent_stop`) |
+| 10 | stuck_loop | stuck_loop | copy-fidelity bug reproduces in **both** checkpoints — most reliable repro |
+| 14 | stuck_loop | stuck_loop | second persistent repro (redundancy on the top-priority bug) |
+| 6 | stuck_loop | timeout | the loop→disengage *shift* between checkpoints, directly |
+| 9 | stuck_loop | timeout | second instance of the shift, confidence it's not one-off |
+| 13 | too_many_errors | timeout | the one error-cascade case seen so far |
+| 3 | timeout | user_stop(reward 0) | sft-500's only natural conversational end that still failed |
+
+**Mitigation plan, two failure modes, two different fixes — do not conflate them:**
+
+1. **Mode-A copy-fidelity** (repeats an identical *wrong* tool-call argument — task 28's
+   `amelia_ross_1297` for the correctly-spelled `amelia_rossi_1297`; present in both checkpoints).
+   The readout ladder (§11) built rungs 1-2 but never rung 3, and rung 3 is the one that actually
+   isolates the bug:
+   - Readout 1 (real audio, unchanged prompt) — reproduces the error, confounded by other behavior.
+   - Readout 2 ("repeat back what you heard, no tool call") — near-miss result, doesn't cleanly
+     separate perception from copying.
+   - **Readout 3 (ID given as literal text, no audio) — not yet built.** If the model still can't
+     copy a clean-text ID verbatim into a tool-call argument, the bug is an LLM copy-into-slot
+     weakness, independent of speech. If it copies correctly here but fails on audio, the bug is
+     upstream in the speech encoder (`nemotron-speech-streaming-en-0.6b`). The fix is different in
+     each case (targeted synthetic SFT drills for the LLM-side; ASR fine-tuning for the encoder-side)
+     — building the fix before this check risks fixing the wrong layer. **Doing this next.**
+2. **Disengagement/silence** (37.5% of sft-500's failures make zero tool calls at all). Looks like a
+   checkpoint-selection artifact, not a capability wall — step500 was picked by forward-loss, which
+   §12 proved doesn't track live success. Plan: re-sweep the same SFT run's checkpoints (e.g. steps
+   100-900) using the 8-task subset above, scored by actual disengagement/success rate instead of
+   loss. If disengagement appears at *every* step, it's not a selection problem — it would point to
+   the training data lacking "try something under uncertainty" examples (consistent with §11's
+   finding that in-domain SFT went completely silent while cross-domain SFT at least engaged
+   conversationally without completing).
+3. **too_many_errors** — only 1 instance so far (base, task 13). Deprioritized; worth a quick look
+   at what actually cascaded once 1-2 are addressed, not before.
+
+**How to apply:** finish readout 3 before writing any copy-fidelity training data — it decides which
+of two very different fixes is correct. Run the checkpoint re-sweep (item 2) in parallel; it's
+independent (offline probing vs. live GPU eval, no resource conflict).
+
+---
+
+## 14. 2026-09-02: readout 3 abandoned as designed; clean audio finds a real, length-dependent
+## perception limit instead
+
+**Readout 3 (text-injection variant) was abandoned — every attempt was confounded by the
+injection method itself, not by copy-fidelity.** Five iterations, in order: (1) spelling the id
+with commas in the prompt — model correctly rejected it as a malformed id, not a copy failure;
+(2) a plain-language instruction with the compact id — model ignored it, fell into a generic
+Mode-H-style refusal; (3) a fake `<TOOLCALL>`/`<TOOL_RESPONSE>` pair asking the model to *repeat*
+the call — it correctly treated repeating an already-succeeded lookup as unnecessary and answered
+conversationally instead; (4) the same fake exchange but asking for a genuine next action
+(cancel) — **worked cleanly for `retail__78`** (correctly copied `W5056519` into
+`cancel_pending_order`), but the 3 airline receipts kept asking for a `user_id` regardless; (5)
+added a second fake exchange to satisfy that — **made zero difference**, identical text either
+way, falsifying the "airline needs both ids" theory. Conclusion: hand-inventing a prompt
+convention the model never trained on reliably produces confounds unrelated to the question being
+asked. One clean data point survived (`retail__78`: copy-into-slot works given clean, unambiguous,
+motivated conditions) but 3/4 stayed inconclusive after 5 iterations of harness engineering — not
+worth a 6th.
+
+**Replaced with a direct test of the perception hypothesis instead of an indirect one on the copy
+side: clean (non-degraded) audio through the model's real audio pathway, no text injection at
+all.** `scripts/mode_a_readout_clean_audio.py` synthesizes each receipt's id spelled out
+letter/digit-by-letter via Gemini TTS (16kHz, no telephony compression, no channel effects — the
+real τ-voice recordings are 8kHz telephony-degraded) and runs both readout-1-style (real domain
+policy + tools) and readout-2-style ("repeat back what you heard") probes on it.
+
+Readout-1-style was uninterpretable again — Mode H fired on all 4 regardless of audio content,
+confirming (not new) that the long real domain-policy prompt is the trigger, independent of audio.
+Readout-2-style gave the real signal, after fixing a scoring bug (`normalise_id` doesn't convert
+word-form digits, so "S I five U K W" didn't string-match "SI5UKW" despite being a verbatim
+transcription — corrected by hand-checking the actual repeated text against what was spoken):
+
+| episode | spoken (comma-sep, 16kHz clean) | model repeated back | verdict |
+|---|---|---|---|
+| airline__28 | S, I, five, U, K, W (6 tokens, 6.1s) | "S I five U K W" | **perfect** |
+| airline__40 | three, R, K, two, T, nine (6 tokens, 7.1s) | "three R-K two T nine" | **perfect** |
+| airline__3 | A,N,Y,A,\_,G,A,R,C,I,A,\_,5,9,0,1 (16 tokens, 12.2s) | "A, R, C, I, A, five, nine, zero, one" | **dropped 5 leading tokens** (N,Y,A,\_,G) |
+| retail__78 | W,5,0,5,6,5,1,9 (8 tokens, 7.2s) | "five-zero five-six five-one nine" | **dropped the leading W**, digits all correct |
+
+**Real finding: a length/complexity-dependent perception limit exists even with zero audio
+degradation.** Short spans (6 tokens) are perceived perfectly; longer/more complex spans (16
+tokens with an underscore; 8 tokens starting with a letter before digits) genuinely drop leading
+characters. This is not explainable by telephony/channel degradation — it happens on pristine
+audio. It also isn't purely a duration effect: `airline__40` (7.1s) was perfect while `retail__78`
+(7.2s, almost identical duration) dropped a character, so token count/complexity may matter as
+much as raw seconds.
+
+**A concrete, verified architectural candidate mechanism — not fully isolated as *the* cause.**
+`examples/speechlm2/conf/finetune/s2s_duplex_stt_11b.yaml`'s perception config pins
+`att_context_size: [70, 0]` — fully causal, zero look-ahead, chosen deliberately over the ASR
+checkpoint's native multi-context options for real-time duplex latency (the config's own comment
+says so). Combined with the ASR preprocessor (`window_stride: 0.01`, `subsampling_factor: 8` from
+the extracted `nemotron-speech-streaming-en-0.6b.nemo`'s `model_config.yaml`), each encoder frame
+covers 80ms and the left-context window is 70 × 80ms = **5.6 seconds** — a real, hard, causal
+bound on how far back each frame's self-attention can see. This is consistent with the pattern
+(longer utterances lose *early* content) but the `airline__40`-vs-`retail__78` near-duration-tie
+with opposite outcomes means duration-vs-5.6s-window isn't the whole story. A second candidate,
+not ruled out: the LLM decoder's own `HybridMambaAttentionDynamicCache` — Mamba state compression
+can also lose fine-grained early information over long sequences, a completely different layer
+from the encoder's attention window. Not disentangled; would need a dedicated test (e.g. same
+6-token content padded to varying total durations, holding token count constant) to separate
+duration from token-count/complexity as the driver, and a separate probe to isolate encoder vs.
+decoder-cache effects. Not pursued further this session — diminishing returns against the time
+already spent isolating this one question.
+
+**How to apply going forward:** treat "a real, length/complexity-dependent perception limitation
+exists independent of audio degradation, mechanism not fully isolated between encoder attention
+window and decoder cache" as the working characterization of mode A's audio-side contribution.
+Practically, this favors a fix that's robust regardless of which sub-mechanism is responsible:
+**augment SFT data with longer, more complex spelled-id utterances** (varying length and token
+count, not just the short/simple spans organic collection tends to produce) rather than committing
+to an architecture-level change (relaxing `att_context_size`, which would need retraining the
+released ASR encoder and re-validating real-time latency) without clearer evidence the encoder
+specifically, not the decoder cache, is the bottleneck. Superseded §13 item 1's "readout 3 decides
+between LLM-copy-drills and encoder fine-tuning" framing — it's not a clean either/or; the answer
+is "audio-side, length-dependent, mechanism-agnostic data augmentation" — pending anyone dedicating
+time to the follow-up test above.
